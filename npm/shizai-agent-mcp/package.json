@@ -1,0 +1,23 @@
+{
+  "name": "shizai-agent-mcp",
+  "version": "0.5.5",
+  "description": "Installer and launcher for the Shizai Agent local MCP server",
+  "bin": {
+    "shizai-agent-mcp": "bin/shizai-agent-mcp.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "keywords": [
+    "mcp",
+    "shizai-agent",
+    "codex",
+    "cursor",
+    "claude"
+  ],
+  "license": "MIT"
+}
