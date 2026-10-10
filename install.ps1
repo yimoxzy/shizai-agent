@@ -1,17 +1,23 @@
 [CmdletBinding()]
 param(
-    [string]$Version = '0.7.27',
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ShizaiAgent')
+    [string]$Version = '0.7.32',
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ShizaiAgent'),
+    [switch]$WithBrowserExtension,
+    [switch]$WithoutBrowserExtension
 )
 
 $ErrorActionPreference = 'Stop'
-$uri = "https://raw.githubusercontent.com/yimoxzy/shizai-agent/main/release/install.ps1"
-$script = Invoke-RestMethod -Uri $uri
-$temporaryScript = Join-Path ([IO.Path]::GetTempPath()) ("shizai-agent-install-" + [guid]::NewGuid().ToString('N') + '.ps1')
+if (-not (Get-Command npx.cmd -ErrorAction SilentlyContinue)) {
+    throw 'Node.js 18+ is required for the npm installer. Alternatively use release/install.ps1 from the source checkout.'
+}
+if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version.' }
+$previousInstallDirectory = $env:SHIZAI_AGENT_HOME
 try {
-    [IO.File]::WriteAllText($temporaryScript, $script, [Text.UTF8Encoding]::new($false))
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $temporaryScript -Version $Version -InstallDir $InstallDir
-    exit $LASTEXITCODE
+    $env:SHIZAI_AGENT_HOME = $InstallDir
+    $arguments = @('-y', "shizai-agent-mcp@$Version", 'install')
+    if ($WithoutBrowserExtension) { $arguments += '--without-browser-extension' }
+    & npx.cmd @arguments
+    if ($LASTEXITCODE -ne 0) { throw "MCP installation failed with exit code $LASTEXITCODE" }
 } finally {
-    if ([IO.File]::Exists($temporaryScript)) { [IO.File]::Delete($temporaryScript) }
+    $env:SHIZAI_AGENT_HOME = $previousInstallDirectory
 }

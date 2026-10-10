@@ -665,11 +665,22 @@ def _component_outputs(record: dict[str, Any], args: list[Any]) -> dict[str, Any
         and item.get("isExport") in (1, 3)
         and item.get("defaultValue") not in (None, "")
     }
+    logical_defaults = [
+        str(default_values[name]).strip()
+        for name in assign_to
+        if name in default_values and str(default_values[name]).strip()
+    ]
     return {
         "assign_to": assign_to,
+        "native_assignment_parameters": assign_to,
         "exported_parameters": exported,
         "primary": assign_to[0] if assign_to else (exported[0] if exported else None),
         "declared_defaults": default_values,
+        "logical_defaults": logical_defaults,
+        "planning_rule": (
+            "omit plan.steps[].outputs and let MCP derive logical variables; "
+            "assign_to/native_assignment_parameters are native config slots, not logical output names"
+        ),
     }
 
 
@@ -747,6 +758,12 @@ def component_capabilities(record: dict[str, Any]) -> dict[str, Any]:
         and bool(categories.intersection({"get_web_data", "data_parse", "get_soft_data"}))
     ):
         capabilities.add("extract")
+    similar_element_list = "similarelementlist" in lowered_type and {"uiSelector", "action"}.issubset(input_names)
+    if similar_element_list:
+        # This native component can return repeated text, values, attributes,
+        # or absolute URLs in one call. Surface that behavior to capability
+        # searches so a small planner can find it as a collection fallback.
+        capabilities.update(("extract", "list", "link"))
     if categories.intersection({"data_parse", "data_process"}) or "deduplication" in input_names:
         capabilities.add("transform")
     if {"collect_items", "max_rows", "limit"}.intersection(input_names):
@@ -810,12 +827,65 @@ def component_capabilities(record: dict[str, Any]) -> dict[str, Any]:
     }
     if "extract" in capabilities:
         hints["page_evidence"] = "Bind collection fields from the live result page after navigation."
+    if similar_element_list:
+        hints["similar_element_actions"] = {
+            "selector": "return native element objects",
+            "gettext": "return visible text values",
+            "value": "return element values",
+            "absoluteurl": "return href/src values; set attr_complate=true for absolute URLs",
+            "attr": "return attr_name values",
+        }
+        hints["alignment_rule"] = (
+            "The output is one flat list. When combining it with another table or other field lists, "
+            "verify equal row counts and preserve row order before writing the final artifact."
+        )
+    if component_type == "WebBrowser_DataCollectionV5":
+        hints["runtime_capability_limits"] = {
+            "table_nested_attribute": (
+                "When collectionConfig.tableSelector is populated, the installed RuntimeHost reads table-cell text. "
+                "A link column configured as dataAttrName=href can therefore return the nested anchor text instead of href."
+            ),
+            "required_action": (
+                "Validate a real output row. If the link column is not a URL, stop retrying column selectors and choose "
+                "a live, materializable alternative such as Element_SimilarElementList_V2(action=absoluteurl), another "
+                "native collection component, or a justified generic preprocessing step."
+            ),
+        }
     if "limit" in capabilities:
         hints["row_limit_parameters"] = [name for name in ("collect_items", "max_rows", "limit") if name in input_names]
     if "paginate" in capabilities:
         hints["pagination_parameters"] = [
             name for name in ("region", "collect_pages", "page_type", "selector_page", "selector_more") if name in input_names
         ]
+        if "region" in input_names:
+            hints["region_modes"] = {
+                "0": {
+                    "meaning": "all_pages",
+                    "use_when": "the request asks for every available page without an exact row target",
+                    "configure": ["page_type", "selector_page_or_selector_more"],
+                    "ignore_for_acceptance": ["collect_pages", "collect_items"],
+                },
+                "1": {
+                    "meaning": "current_page",
+                    "use_when": "the request explicitly limits collection to the current page or first screen",
+                    "configure": [],
+                },
+                "2": {
+                    "meaning": "specified_page_count",
+                    "use_when": "the request specifies a number of pages",
+                    "configure": ["collect_pages", "page_type", "selector_page_or_selector_more"],
+                },
+                "3": {
+                    "meaning": "specified_item_count",
+                    "use_when": "the request specifies an exact or minimum row target",
+                    "configure": ["collect_items", "page_type_num", "selector_page_or_selector_more"],
+                },
+            }
+            hints["region_selection_rule"] = (
+                "Choose region from the user's collection scope. Component defaults such as collect_items=20 "
+                "are runtime parameters, not an output acceptance target. Do not invent output_contract.max_rows "
+                "when the user asks for all pages without a row count."
+            )
         # Pagination is an executable capability of the native collection
         # component, not merely a hint for the client model.  Expose the
         # ownership and stop condition explicitly so a planner does not add
@@ -836,6 +906,27 @@ def component_capabilities(record: dict[str, Any]) -> dict[str, Any]:
         ]
     planning_patterns = []
     if {"extract", "limit", "paginate"}.issubset(capabilities):
+        all_pages_config: dict[str, Any] = {}
+        if "region" in input_names:
+            all_pages_config["region"] = 0
+        if "page_type" in input_names:
+            all_pages_config["page_type"] = "$choose_from_live_page_evidence"
+        if "selector_page" in input_names:
+            all_pages_config["selector_page"] = "$defer_until_next_page_element_is_captured"
+        if "selector_more" in input_names:
+            all_pages_config["selector_more"] = "$defer_until_load_more_element_is_captured"
+        planning_patterns.append(
+            {
+                "when": "request asks for all available pages and has no numeric row target",
+                "goal": "collect every available page until the pagination control is unavailable",
+                "semantic_config": all_pages_config,
+                "output_contract": {"max_rows": None},
+                "selection_rule": (
+                    "Use the component's all-pages mode when its native pagination control fits the live page; "
+                    "capture only the selected next-page or load-more control."
+                ),
+            }
+        )
         pattern_config: dict[str, Any] = {}
         if "region" in input_names:
             pattern_config["region"] = 3
@@ -872,6 +963,22 @@ def component_capabilities(record: dict[str, Any]) -> dict[str, Any]:
                 "when": "a search input should be submitted immediately after setting its value",
                 "goal": "set the query and submit it with the same installed element component",
                 "semantic_config": {"text": "$request_search_value", "isEnter": True},
+            }
+        )
+    if similar_element_list:
+        planning_patterns.append(
+            {
+                "when": "the page contains repeated product/detail anchors and a real URL list is required",
+                "goal": "extract every repeated href/src value with one native component call",
+                "semantic_config": {
+                    "action": "absoluteurl",
+                    "attr_complate": True,
+                    "uiSelector": "$defer_until_two_repeated_links_are_verified",
+                },
+                "selection_rule": (
+                    "Use current-page evidence for the repeated link selector. Verify list length and order before "
+                    "combining it with other collected fields."
+                ),
             }
         )
     return {
@@ -1119,6 +1226,12 @@ def _matches(
     ]
     fields.extend(item.get("label") for item in _tag_items(record))
     haystack = " ".join(str(item or "") for item in fields).casefold()
+    component_name = str(record.get("type") or "").casefold()
+    if "runjs" in component_name or "javascript" in haystack:
+        # The designer calls this family "执行JS", while models commonly ask
+        # for JavaScript, browser scripts, or page scripts. These aliases are
+        # component vocabulary only; they do not encode any website behavior.
+        haystack += " javascript javascript代码 js脚本 执行脚本 浏览器脚本 网页脚本 网页执行"
     return all(part in haystack for part in query.casefold().split() if part)
 
 
@@ -1632,6 +1745,40 @@ def component_catalog(
         next_action = "安装或启动实在设计器后重新查询 builtin 组件；登录 SaaS 设计器后重新查询 business 扩展。"
     else:
         next_action = None
+    returned_component_types = [
+        str(item.get("type") or "").strip()
+        for item in selected_components
+        if str(item.get("type") or "").strip()
+    ]
+    if component_type and detail in {"contract", "full"} and returned_component_types:
+        selection_guidance = {
+            "phase": "contract_ready",
+            "component_types": returned_component_types,
+            "contract_complete": True,
+            "repeat_lookup": False,
+            "next": (
+                "保留并使用本次返回的契约；同一请求不要再次查询这些 component_type。"
+                "如果所有最终步骤的契约均已读取，直接构造并校验计划。"
+            ),
+        }
+    elif detail == "summary":
+        selection_guidance = {
+            "phase": "shortlist_ready",
+            "component_types": returned_component_types,
+            "contract_complete": False,
+            "repeat_lookup": False,
+            "next": (
+                "只从 component_types 中选择最终步骤，然后每个已选 type 精确读取一次 contract；"
+                "不要猜测未返回的类型，也不要枚举未选替代组件。"
+            ),
+        }
+    else:
+        selection_guidance = {
+            "phase": "catalog_page_ready",
+            "component_types": returned_component_types,
+            "contract_complete": bool(component_type and detail in {"contract", "full"}),
+            "repeat_lookup": False,
+        }
     result = {
         "kind": "native_rpa_component_catalog",
         "catalog_kind": "rpa_component_catalog",
@@ -1707,6 +1854,7 @@ def component_catalog(
         "role_selection": role_selection,
         "role_selection_contract": role_selection_contract,
         "components": selected_components,
+        "selection_guidance": selection_guidance,
         "planning_guidance": {
             "planning_policy": {
                 "owner": "client_model",
@@ -1796,7 +1944,7 @@ def component_catalog(
         retained = (
             "kind", "scope", "ready", "source", "sources", "filters", "filter_relaxation",
             "page", "limit", "has_more", "next_page", "total_components", "matched_components",
-            "components", "business_packages", "next_action",
+            "components", "business_packages", "selection_guidance", "next_action",
         )
         result = {key: result[key] for key in retained}
         result["response_mode"] = "compact"

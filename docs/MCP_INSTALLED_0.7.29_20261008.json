@@ -1,0 +1,37 @@
+{
+  "kind": "installed_release_audit",
+  "native_rpa_executed": false,
+  "installed_version": "0.7.29",
+  "tools": {
+    "full": 67,
+    "rpa-authoring": 43
+  },
+  "payload_verified": true,
+  "extension_version": "0.1.9",
+  "identity_preserved": true,
+  "port_preserved": true,
+  "native_host_registrations": {
+    "chrome": true,
+    "edge": true
+  },
+  "native_host_bootstrap_verified": true,
+  "mcp_stderr_empty": true,
+  "browser_status": {
+    "kind": "mcp_browser_bridge_status",
+    "state": "extension_missing",
+    "connected": false,
+    "port": 18768,
+    "connection_mode": "owner",
+    "requires_user_action": true,
+    "extension_id": "onlmcbjbkkjllainhobbehhaohnkloem",
+    "retryable": true,
+    "resolution": "Open Chrome with the companion extension enabled; it reconnects automatically.",
+    "next_action": {
+      "tool": "shizai_browser_status",
+      "arguments": {
+        "connect_wait": 2
+      }
+    },
+    "bridge_listening": true
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Shizai MCP Browser Bridge",
+  "version": "0.1.11",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwfZPPCIqFCHKYhspWZ6f8cxxloM6ckQQOGu6Nn5iVrz/zmV5IUFuj13d6lBvxk0qAMgY+KwPJw0V/ymE8qWeVurLzVNbbQSFiMYFPzsglLEZ6tfsYqh2glMAu9J3VCNqKSFmqkxxkI07Fn7dTzojjEQSfZg3q5nQFPQfHwSxsFHUJOYIpi9SMCnPa1AkJB29JAwaQicj1PVT9MRlQcANPseQzBEDAw6n3pMp68gTopYEa2aOgPnIVNDtcbT6eD2UYkoCeHUCdan6XxtvQOtqtaoQr1CexR/E6O/ClxriIwzVoC09eThoMll6r+eQcj4fbJNLirrErcnWzB+Vn+bqZQIDAQAB",
+  "description": "A small browser bridge for visual element inspection and verified collection locators.",
+  "permissions": ["activeTab", "tabs", "scripting", "storage", "nativeMessaging", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "service_worker.js" },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["src/core.js", "content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": { "default_title": "Shizai MCP Browser Bridge" }
+}

@@ -9,7 +9,7 @@ const { execFileSync, spawn } = require('node:child_process');
 
 const SERVER = 'shizai-agent';
 const REPO = process.env.SHIZAI_AGENT_REPO || 'yimoxzy/shizai-agent';
-const DEFAULT_VERSION = process.env.SHIZAI_AGENT_VERSION || '0.7.27';
+const DEFAULT_VERSION = process.env.SHIZAI_AGENT_VERSION || require('../package.json').version;
 const installRoot = process.env.SHIZAI_AGENT_HOME || path.join(
   process.env.LOCALAPPDATA || path.join(os.homedir(), '.local'), 'Programs', 'ShizaiAgent'
 );
@@ -17,7 +17,7 @@ const installRoot = process.env.SHIZAI_AGENT_HOME || path.join(
 function fail(message) { console.error(`shizai-agent-mcp: ${message}`); process.exitCode = 1; }
 function json(value) { console.log(JSON.stringify(value, null, 2)); }
 function help() {
-  console.log(`Shizai Agent MCP installer\n\nUsage:\n  shizai-agent-mcp install [--version VERSION]\n  shizai-agent-mcp register <codex|cursor|claude>\n  shizai-agent-mcp status\n  shizai-agent-mcp path\n  shizai-agent-mcp uninstall\n\nEnvironment:\n  SHIZAI_AGENT_VERSION  Release version (default: ${DEFAULT_VERSION})\n  SHIZAI_AGENT_HOME     Installation directory\n  SHIZAI_AGENT_REPO     GitHub repository owner/name\n  SHIZAI_AGENT_RELEASE_BASE_URL  Override release asset base URL\n`);
+  console.log(`Shizai Agent MCP installer\n\nUsage:\n  shizai-agent-mcp install [--version VERSION] [--without-browser-extension]\n  shizai-agent-mcp register <codex|cursor|claude|browser>\n  shizai-agent-mcp status\n  shizai-agent-mcp path\n  shizai-agent-mcp uninstall\n\nBrowser extension files and native host registration are prepared by default.\nLoad the extension in Chrome/Edge once; --without-browser-extension skips host setup.\n\nEnvironment:\n  SHIZAI_AGENT_VERSION  Release version (default: ${DEFAULT_VERSION})\n  SHIZAI_AGENT_HOME     Installation directory\n  SHIZAI_AGENT_REPO     GitHub repository owner/name\n  SHIZAI_AGENT_RELEASE_BASE_URL  Override release asset base URL\n`);
 }
 function binaryPath() { return path.join(installRoot, 'shizai-agent-mcp.exe'); }
 function validateInstallRoot() {
@@ -26,11 +26,21 @@ function validateInstallRoot() {
   if (resolved === parsed.root || resolved === path.resolve(os.homedir())) {
     throw new Error(`拒绝使用过宽的安装目录：${resolved}`);
   }
+  if (fs.existsSync(resolved) && fs.readdirSync(resolved).length && !fs.existsSync(path.join(resolved, 'shizai-agent-mcp.exe'))) {
+    throw new Error('拒绝替换非 Shizai Agent 安装目录');
+  }
   return resolved;
 }
 function psQuote(value) { return `'${String(value).replaceAll("'", "''")}'`; }
+function powerShellOptions() {
+  // A host running PowerShell 7 can pass its module search path through Node.
+  // Windows PowerShell must resolve its own built-in modules first.
+  const builtin = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
+  return { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, PSModulePath: [builtin, process.env.PSModulePath].filter(Boolean).join(path.delimiter) } };
+}
 function runPowerShell(script, args = []) {
-  return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script, ...args], { encoding: 'utf8' });
+  return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script, ...args], powerShellOptions());
 }
 function sleepSync(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -53,7 +63,8 @@ function stopInstalledProcesses(destination) {
   if (process.platform !== 'win32') return [];
   const executables = [
     path.join(destination, 'shizai-agent-mcp.exe'),
-    path.join(destination, 'shizai-agent.exe')
+    path.join(destination, 'shizai-agent.exe'),
+    path.join(destination, 'shizai-agent-browser-host.exe')
   ];
   const targetList = executables.map(psQuote).join(', ');
   const script = String.raw`
@@ -125,7 +136,7 @@ function download(url, destination, options = {}) {
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
-  const script = `Invoke-WebRequest -UseBasicParsing -Uri ${psQuote(url)} -OutFile ${psQuote(destination)} -ProgressAction SilentlyContinue`;
+  const script = `$ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Uri ${psQuote(url)} -OutFile ${psQuote(destination)}`;
   runPowerShell(script);
 }
 function install(version, options = {}) {
@@ -140,6 +151,7 @@ function install(version, options = {}) {
   const stage = path.join(parent, `.shizai-agent-stage-${nonce}`);
   const backup = path.join(parent, `.shizai-agent-backup-${nonce}`);
   let verified = false;
+  let committed = false;
   const stoppedProcesses = new Set();
   try {
     download(url, archive, { progress: true });
@@ -166,10 +178,17 @@ function install(version, options = {}) {
       if (!nested) throw new Error('发布包中未找到 shizai-agent-mcp.exe');
       source = nested;
     }
-    fs.writeFileSync(path.join(source, 'version.json'), JSON.stringify({ version, asset, installedAt: new Date().toISOString() }, null, 2));
-    cleanupInstallArtifacts(parent, [stage, backup]);
+    const verification = verifyPackage(source, version);
+    fs.writeFileSync(path.join(source, 'version.json'), JSON.stringify({
+      version, asset, installedAt: new Date().toISOString(),
+      manifest_sha256: verification.manifest_sha256, tools: verification.tools
+    }, null, 2));
+    const oldBridge = path.join(destination, 'browser-bridge.json');
+    if (fs.existsSync(oldBridge)) fs.copyFileSync(oldBridge, path.join(source, 'browser-bridge.json'));
     for (const processId of stopInstalledProcesses(destination)) stoppedProcesses.add(processId);
     let previousMoved = false;
+    const result = { installed: true, version, directory: destination, command: binaryPath(), verified,
+      tools: verification.tools, browser_extension_version: verification.extension_version };
     try {
       if (fs.existsSync(destination)) {
         fs.renameSync(destination, backup);
@@ -177,51 +196,69 @@ function install(version, options = {}) {
         for (const processId of stopInstalledProcesses(destination)) stoppedProcesses.add(processId);
       }
       fs.renameSync(source, destination);
+      if (!options.skipRegister) result.registration = registerCodex(true);
+      if (options.withBrowserExtension !== false) result.browser_extension = registerBrowser(true);
+      committed = true;
     } catch (error) {
-      if (!fs.existsSync(destination) && previousMoved && fs.existsSync(backup)) {
+      if (previousMoved && fs.existsSync(backup)) {
+        for (const processId of stopInstalledProcesses(destination)) stoppedProcesses.add(processId);
+        // Keep the old installation recoverable until registration also succeeds.
+        const failedInstall = path.join(parent, `.shizai-agent-failed-${nonce}`);
+        if (fs.existsSync(destination)) fs.renameSync(destination, failedInstall);
         fs.renameSync(backup, destination);
+        removeDirectoryWithRetries(failedInstall);
       }
       throw error;
     }
-    if (previousMoved) {
-      try {
-        removeDirectoryWithRetries(backup);
-      } catch (error) {
-        for (const processId of stopInstalledProcesses(destination)) stoppedProcesses.add(processId);
-        try {
-          removeDirectoryWithRetries(backup);
-        } catch (retryError) {
-          const failedInstall = path.join(temp, 'failed-install');
-          fs.renameSync(destination, failedInstall);
-          fs.renameSync(backup, destination);
-          removeDirectoryWithRetries(failedInstall);
-          throw new Error(`旧版本清理失败，已恢复原安装：${retryError.message}`);
-        }
-      }
-    }
-    cleanupInstallArtifacts(parent, [stage, backup]);
-    const result = { installed: true, version, directory: destination, command: binaryPath(), verified, stopped_processes: [...stoppedProcesses].sort((left, right) => left - right) };
-    if (!options.skipRegister) result.registration = registerCodex(true);
+    result.stopped_processes = [...stoppedProcesses].sort((left, right) => left - right);
     console.log(`安装成功：Shizai Agent MCP v${version}`);
     if (result.registration?.registered) console.log('Codex MCP 已注册');
+    if (result.browser_extension?.registered) {
+      console.log(`浏览器扩展文件已准备：${result.browser_extension.extension_path}`);
+      console.log('首次使用：在 chrome://extensions 或 edge://extensions 加载该目录；连接状态以 shizai_browser_status 为准。');
+    }
     return result;
   } finally {
     removeDirectoryWithRetries(temp);
     removeDirectoryWithRetries(stage);
-    if (fs.existsSync(backup) && fs.existsSync(destination)) removeDirectoryWithRetries(backup);
+    if (committed && fs.existsSync(backup)) removeDirectoryWithRetries(backup);
   }
 }
+function verifyPackage(root, version) {
+  const script = path.join(root, 'scripts', 'verify-package.ps1');
+  if (!fs.existsSync(script)) throw new Error('发布包缺少完整性校验器，请使用新版发布包');
+  const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', script, '-PackageRoot', root, '-Version', version],
+    powerShellOptions()).replace(/^\uFEFF/, '').trim();
+  return JSON.parse(output);
+}
+function installationStatus() {
+  const metadataFile = path.join(installRoot, 'version.json');
+  const metadata = fs.existsSync(metadataFile) ? JSON.parse(fs.readFileSync(metadataFile, 'utf8').replace(/^\uFEFF/, '')) : {};
+  let verification;
+  try { verification = verifyPackage(installRoot, metadata.version || DEFAULT_VERSION); }
+  catch (_) { verification = { verified: false, reason: '安装文件缺失、损坏或来自未校验的旧发布包，请重新安装最新版' }; }
+  return { installed: fs.existsSync(binaryPath()), version: metadata.version || null, installer_version: require('../package.json').version,
+    directory: installRoot, command: binaryPath(), verification,
+    browser_extension_files_present: fs.existsSync(path.join(installRoot, 'browser-extension', 'manifest.json')),
+    native_host_present: fs.existsSync(path.join(installRoot, 'shizai-agent-browser-host.exe')),
+    browser_config_present: fs.existsSync(path.join(installRoot, 'browser-bridge.json')),
+    browser_extension_loaded: null, browser_extension_path: path.join(installRoot, 'browser-extension') };
+}
 function replaceTomlSection(content, section, replacement) {
-  const header = `[${section}]`;
   const lines = String(content || '').split(/\r?\n/);
   const kept = [];
   let skipping = false;
   for (const line of lines) {
-    if (line.trim() === header) {
-      skipping = true;
-      continue;
+    const match = line.trim().match(/^\[([^\]]+)\]$/);
+    if (match) {
+      const table = match[1];
+      if (table === section || table.startsWith(`${section}.`)) {
+        skipping = true;
+        continue;
+      }
+      skipping = false;
     }
-    if (skipping && /^\s*\[.*\]\s*$/.test(line)) skipping = false;
     if (!skipping) kept.push(line);
   }
   const next = kept.join('\n').trimEnd();
@@ -235,10 +272,25 @@ function registerCodex(silent = false) {
   if (old) fs.copyFileSync(config, `${config}.shizai-agent.bak`);
   // Keep this local stdio server on Codex's direct tool path. Some custom
   // Responses providers do not support Codex's deferred tool-search payload.
-  const section = `[mcp_servers.${SERVER}]\ncommand = ${tomlString(binaryPath())}\nargs = []\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\nomit_tools_from = [\"deferred\"]`;
+  const section = `[mcp_servers.${SERVER}]\ncommand = ${tomlString(binaryPath())}\nargs = []\nenabled = true\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\nomit_tools_from = [\"deferred\"]\n\n[mcp_servers.${SERVER}.env]\nSHIZAI_MCP_TOOL_PROFILE = \"rpa-authoring\"`;
   const next = replaceTomlSection(old, `mcp_servers.${SERVER}`, section);
   fs.writeFileSync(config, next, 'utf8');
-  const result = { registered: true, client: 'codex', config, command: binaryPath() };
+  const persisted = fs.readFileSync(config, 'utf8');
+  const verified = persisted.includes(`[mcp_servers.${SERVER}]`) &&
+    persisted.includes(`[mcp_servers.${SERVER}.env]`) &&
+    persisted.includes(`command = ${tomlString(binaryPath())}`) &&
+    persisted.includes('enabled = true') &&
+    persisted.includes('SHIZAI_MCP_TOOL_PROFILE = "rpa-authoring"');
+  if (!verified) throw new Error('Codex MCP 配置写入后校验失败');
+  const result = {
+    registered: true,
+    verified,
+    client: 'codex',
+    config,
+    command: binaryPath(),
+    tool_profile: 'rpa-authoring',
+    restart_required: true
+  };
   if (!silent) json(result);
   return result;
 }
@@ -256,9 +308,37 @@ function registerJsonClient(client) {
   fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
   json({ registered: true, client, config: file, command: binaryPath() });
 }
+function registerBrowser(silent = false) {
+  const script = path.join(installRoot, 'scripts', 'register-browser.ps1');
+  if (!fs.existsSync(script)) throw new Error('发布包中缺少 register-browser.ps1');
+  const output = execFileSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', script, '-InstallDir', installRoot
+  ], powerShellOptions()).replace(/^\uFEFF/, '').trim();
+  const result = JSON.parse(output);
+  if (!silent) json(result);
+  return result;
+}
+function unregisterBrowser() {
+  const script = path.join(installRoot, 'scripts', 'unregister-browser.ps1');
+  if (!fs.existsSync(script)) return null;
+  const output = execFileSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', script, '-InstallDir', installRoot
+  ], powerShellOptions()).replace(/^\uFEFF/, '').trim();
+  return output ? JSON.parse(output) : null;
+}
 function launch() {
-  if (!fs.existsSync(binaryPath())) install(DEFAULT_VERSION);
+  // stdout is the MCP protocol, so setup/progress must never be printed here.
+  // Upgrades also must not stop other running MCP sessions during a new launch.
+  const metadataFile = path.join(installRoot, 'version.json');
+  const metadata = fs.existsSync(metadataFile) ? JSON.parse(fs.readFileSync(metadataFile, 'utf8').replace(/^\uFEFF/, '')) : {};
+  if (!fs.existsSync(binaryPath()) || metadata.version !== DEFAULT_VERSION) {
+    throw new Error(`请先运行 npx -y shizai-agent-mcp@${DEFAULT_VERSION} install，再启动 MCP`);
+  }
+  verifyPackage(installRoot, DEFAULT_VERSION);
   const child = spawn(binaryPath(), process.argv.slice(2), { stdio: 'inherit', windowsHide: true });
+  child.on('error', error => fail(error.message));
   child.on('exit', code => { process.exitCode = code ?? 0; });
 }
 function main() {
@@ -270,22 +350,27 @@ function main() {
     const index = args.indexOf('--version');
     const version = index >= 0 ? args[index + 1] : args.find(value => !value.startsWith('-'));
     if (index >= 0 && !version) throw new Error('--version 后需要版本号');
-    return install(version || DEFAULT_VERSION, { skipRegister: args.includes('--skip-register') });
+    return install(version || DEFAULT_VERSION, {
+      skipRegister: args.includes('--skip-register'),
+      withBrowserExtension: !args.includes('--without-browser-extension')
+    });
   }
   if (command === 'register') {
     if (!fs.existsSync(binaryPath())) throw new Error('尚未安装，请先运行 install');
     if (target === 'codex') return registerCodex();
     if (target === 'cursor' || target === 'claude') return registerJsonClient(target);
-    throw new Error('请指定 codex、cursor 或 claude');
+    if (target === 'browser') return registerBrowser();
+    throw new Error('请指定 codex、cursor、claude 或 browser');
   }
-  if (command === 'status') return json({ installed: fs.existsSync(binaryPath()), directory: installRoot, command: binaryPath(), versionFile: path.join(installRoot, 'version.json') });
+  if (command === 'status') return json(installationStatus());
   if (command === 'path') return console.log(binaryPath());
   if (command === 'uninstall') {
     const destination = validateInstallRoot();
     const stoppedProcesses = stopInstalledProcesses(destination);
+    const browser = unregisterBrowser();
     removeDirectoryWithRetries(destination);
     if (fs.existsSync(path.dirname(destination))) cleanupInstallArtifacts(path.dirname(destination));
-    return json({ uninstalled: true, directory: destination, stopped_processes: stoppedProcesses });
+    return json({ uninstalled: true, directory: destination, stopped_processes: stoppedProcesses, browser });
   }
   throw new Error(`未知命令：${command}`);
 }

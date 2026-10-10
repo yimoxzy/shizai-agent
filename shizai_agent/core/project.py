@@ -9,6 +9,8 @@ import json
 import os
 import re
 import shutil
+import sqlite3
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -27,7 +29,8 @@ except ImportError:  # pragma: no cover - only used in minimal source checkouts
     padding = Cipher = algorithms = modes = None  # type: ignore[assignment]
 
 from .agent import redact_payload
-from .cloud_api import ShizaiDesktopAgent
+from .cloud_api import ShizaiCloudError, ShizaiDesktopAgent
+from .native_ui import call_active_editor_renderer
 from .paths import ShizaiPaths
 from .storage import (
     iter_application_dirs,
@@ -36,7 +39,14 @@ from .storage import (
     query_rows,
     read_json,
 )
-from .workflow_edit import WorkflowEditError, check_revision, flow_revision, parameter_changes
+from .workflow_edit import (
+    WorkflowEditError,
+    check_revision,
+    flow_revision,
+    parameter_changes,
+    read_edit_context,
+)
+from .workflow_references import JD_PRODUCT_LINK_REFERENCE
 
 KNOWN_JSON_FILES = (
     "szrpa.json",
@@ -135,6 +145,15 @@ def _project_write_lock(paths: ShizaiPaths, project_ref: str | Path) -> Iterable
         finally:
             handle.close()
 DEFAULT_JS_LINK_SCRIPT = r"""function (input) {
+    const visible = (node) => Boolean(node && (node.offsetWidth || node.offsetHeight || node.getClientRects().length));
+    if (Array.from(document.querySelectorAll("input[type='password']")).some(visible)) {
+        throw new Error("SHIZAI_WAITING_FOR_USER:login_required");
+    }
+    if (Array.from(document.querySelectorAll(
+        "iframe[src*='captcha'], [class*='captcha'], [id*='captcha'], [class*='geetest']"
+    )).some(visible)) {
+        throw new Error("SHIZAI_WAITING_FOR_USER:page_challenge");
+    }
     const linkMarker = "data-shizai-agent-product-link";
     const merchantMarker = "data-shizai-agent-product-merchant";
     // The designer declares `input` as rpa_list.  RuntimeHost therefore
@@ -797,6 +816,8 @@ RPA_BUSINESS_RULES = (
         "recommendation": "优先评估并使用能覆盖目标的原生组件；结构化网页采集优先评估 WebBrowser_DataCollectionV5。",
         "must": [
             "必须先比较原生组件的 capabilities、inputs、outputs 与当前目标和页面证据是否匹配。",
+            "结构化网页采集必须先评估原生采集并验证页面字段、XPath、分页和父子记录关系；不能仅凭 extract+output 标签断言适用。",
+            "优先拆分页面准备、原生采集、数据处理/写入；确需脚本替代时，在步骤 native_alternative_reason 中记录具体限制和验证证据。嵌套循环写图未支持时必须报告接口缺口。",
             "如果最终选择 JS、下载、循环或其它组合，必须说明原生组件不适用、能力不足或页面证据不匹配的原因，并验证所选方案的输出。",
             "页面跳转导致 page_identity_changed 时，必须保留同一个 project_ref，重新扫描当前页面，并仅在明确重绑定时传 allow_rebind=true。",
         ],
@@ -859,6 +880,10 @@ def _js_table_script(required_columns: Iterable[str] | None = None, max_rows: An
 DEFAULT_JS_TABLE_SCRIPT = _js_table_script()
 
 _RPA_RESULT_FIELD_ALIASES = {
+    "商品编号": "product_id",
+    "商品ID": "product_id",
+    "货号": "product_id",
+    "SKU": "product_id",
     "商品名称": "product_name",
     "商品名": "product_name",
     "商品标题": "product_name",
@@ -867,9 +892,24 @@ _RPA_RESULT_FIELD_ALIASES = {
     "店铺": "merchant",
     "价格": "price",
     "销量": "sales",
+    "销量原文": "sales",
+    "热度原文": "sales",
+    "指标口径": "sales_metric",
+    "销量口径": "sales_metric",
+    "统计口径": "sales_metric",
     "商品链接": "link",
     "链接": "link",
 }
+_RPA_RESULT_FIELD_ORDER = (
+    "product_id",
+    "product_name",
+    "merchant",
+    "price",
+    "sales",
+    "sales_metric",
+    "link",
+)
+_RPA_RESULT_FIELDS = set(_RPA_RESULT_FIELD_ORDER)
 
 
 def _canonical_result_field(value: Any) -> str:
@@ -889,15 +929,16 @@ def _result_capture_requirements(
         # The page-scoped JS component returns the complete table directly;
         # no generated DOM marker or result-page element binding is needed.
         return set()
-    # The recovery JS step creates both the merchant and product-link nodes in
-    # the same card scope. Native capture therefore only needs the three
-    # fields that the JS step cannot reliably synthesize from the UIA tree.
-    required = {"product_name", "price", "sales"}
-    if not use_js_link:
-        required.add("merchant")
     columns = [str(item).strip() for item in required_columns or [] if str(item).strip()]
-    if not use_js_link and any(_canonical_result_field(item) == "link" for item in columns):
-        required.add("link")
+    required = {
+        canonical
+        for canonical in (_canonical_result_field(item) for item in columns)
+        if canonical in _RPA_RESULT_FIELDS
+    }
+    if use_js_link:
+        # The recovery JS step creates merchant and product-link nodes in the
+        # same card scope, so native capture only supplies requested UI fields.
+        required.difference_update({"merchant", "link"})
     return required
 
 
@@ -913,6 +954,10 @@ def _normalize_generated_collection_bindings(
     their column positions rather than replacing ids by index.
     """
     if not isinstance(element_map, dict):
+        return list(element_ids)
+    if len(element_ids) == len(columns) and all(element_id in element_map for element_id in element_ids):
+        # A complete explicit binding is authoritative. This is how the browser
+        # bridge replaces an older JS-marker collection during flow editing.
         return list(element_ids)
     generated_by_field = {
         "product_name": JS_NAME_ELEMENT_ID,
@@ -940,6 +985,18 @@ def _normalize_generated_collection_bindings(
         if str(item).strip()
     )
     return normalized
+
+
+def _output_names_match(expected: list[str], actual: list[str]) -> bool:
+    """Accept designer collision suffixes while preserving output order and role."""
+
+    if len(expected) != len(actual):
+        return False
+    return all(
+        observed == canonical
+        or bool(re.fullmatch(re.escape(canonical) + r"_[1-9][0-9]*", observed))
+        for canonical, observed in zip(expected, actual)
+    )
 
 
 RPA_EXCEL_COMPONENT_CONTRACTS: tuple[dict[str, Any], ...] = (
@@ -1016,6 +1073,17 @@ RPA_OPTIONAL_COMPONENT_CONTRACTS: tuple[dict[str, Any], ...] = (
         "plan_input_mode": "variables",
         "outputs": ["商品链接"],
     },
+    {
+        "component": "WebBrowser_CloseWeb_V2",
+        "designer_type": "WebBrowser.CloseWeb_V2",
+        "order": 99,
+        "designer_label": "关闭网页",
+        "purpose": "流程结束时关闭本流程创建的网页对象，避免运行产生大量遗留标签页",
+        "requires_elements": False,
+        "inputs": ["colse_type=select", "web", "is_close_alert"],
+        "plan_input_mode": "variables",
+        "outputs": ["操作结果"],
+    },
 )
 RPA_ALL_COMPONENT_CONTRACTS = RPA_COMPONENT_CONTRACTS + RPA_OPTIONAL_COMPONENT_CONTRACTS + RPA_EXCEL_COMPONENT_CONTRACTS
 _NATIVE_RPA_COMPONENTS = {item["component"] for item in RPA_ALL_COMPONENT_CONTRACTS}
@@ -1070,9 +1138,25 @@ def _normalize_js_result_mode(value: Any) -> tuple[str, bool]:
     return canonical, bool(raw) and canonical != raw
 
 
+def _rpa_component_plan(flow: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    """Return one authoritative component plan and identify its source."""
+    if not isinstance(flow, dict):
+        return [], "none"
+    for key in ("execution_plan", "mcpExecutionPlan"):
+        execution_plan = flow.get(key)
+        steps = execution_plan.get("steps") if isinstance(execution_plan, dict) else None
+        if isinstance(steps, list):
+            return steps, f"{key}.steps"
+    for key in ("component_plan", "mcpComponentPlan"):
+        component_plan = flow.get(key)
+        if isinstance(component_plan, list):
+            return component_plan, key
+    return [], "none"
+
+
 def _rpa_sequence(flow: dict[str, Any]) -> list[str]:
     """Return the request plan sequence, or the legacy browser sequence."""
-    component_plan = flow.get("component_plan") or flow.get("mcpComponentPlan")
+    component_plan, _ = _rpa_component_plan(flow)
     # A partial CLI flow may contain the first planned node only.  Treat a
     # plan as an ordering contract only after it has been attached as a
     # complete MCP execution plan; otherwise the client remains free to add
@@ -1189,7 +1273,9 @@ def _constant_native_types(parameter: dict[str, Any]) -> set[str]:
     families = {"rpa_pd": "dataframe", "rpa_list": "list", "rpa_dict": "dict",
                 "rpa_str": "string", "rpa_str_file": "string", "rpa_str_folder": "string",
                 "rpa_num": "number", "rpa_int": "number", "rpa_bool": "bool"}
+    families.update({t: "list" for t in result if t.startswith("rpa_list_")})
     families.update({t: f"handle:{t}" for t in result if t.startswith("rpa_h")})
+    families.update({t: f"handle:{t}" for t in result if t.startswith("rpa_window")})
     return {families[t] for t in result} if result and result <= families.keys() else set()
 
 
@@ -1353,6 +1439,7 @@ RPA_STEP_REQUIRED_ARGUMENTS: dict[str, tuple[str, ...]] = {
     # uses the pagination-button mode; a single-page collection must leave it
     # empty instead of binding a page-scope element.
     "WebBrowser_DataCollectionV5": ("var0", "config", "designated_obj"),
+    "WebBrowser_CloseWeb_V2": ("colse_type", "web"),
     "Excel_Cs_NewV4": ("var_name", "path", "name"),
     "Excel_Cs_WriteRange": ("workbook", "sheet", "row", "column", "contents"),
 }
@@ -1375,9 +1462,176 @@ RPA_STEP_OUTPUT_VARIABLES: dict[str, tuple[str, ...]] = {
     # native designer task, even when monitor_data is disabled. Keep the
     # contract aligned with var0/var1/var2 emitted by RuntimeHost.
     "WebBrowser_DataCollectionV5": ("数据采集结果", "Excel路径", "监控空列数据"),
+    "WebBrowser_CloseWeb_V2": ("操作结果",),
+    "Database_DBConnect": ("数据库对象",),
+    "Database_SQLExecute": ("SQL执行结果",),
+    "Database_BatchSQLExecute": ("SQL执行结果",),
+    "Database_BatchInsertExecute": ("批量插入结果",),
+    "Database_CloseDBConnect": ("数据库对象",),
+    "JSON_Parse": ("转换结果",),
+    "JSON_Stringify": ("转换结果",),
     "Excel_Cs_NewV4": ("Excel文件",),
     "Excel_Cs_WriteRange": (),
 }
+
+# Components that publish the browser object consumed by later page components.
+RPA_BROWSER_OBJECT_COMPONENTS: tuple[str, ...] = ("WebBrowser_CreateV3", "WebBrowser_GetTAB_V1")
+RPA_DEFAULT_WEB_PAGE_OBJECT = "网页对象"
+
+
+def _output_variables_match(component: str, expected: list[str], actual: list[str]) -> bool:
+    """Match declared outputs against the slots the native component actually writes.
+
+    A plan may name fewer outputs than the component emits, because the designer
+    always writes every slot the component declares.  Surplus trailing slots are
+    therefore acceptable when each one is a canonical output of this component;
+    anything else is still a mismatch.
+    """
+    if len(actual) < len(expected):
+        return False
+    if not _output_names_match(expected, actual[: len(expected)]):
+        return False
+    canonical = RPA_STEP_OUTPUT_VARIABLES.get(component, ())
+    return all(
+        any(_output_names_match([name], [observed]) for name in canonical)
+        for observed in actual[len(expected) :]
+    )
+
+
+def _logical_plan_outputs(
+    component: str,
+    contract: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    require_assignments: bool = False,
+) -> list[str]:
+    """Resolve logical outputs without exposing native assignment slots."""
+    output_parameters = [
+        str(item).strip() for item in contract.get("output_parameters", []) if str(item).strip()
+    ]
+    if output_parameters:
+        missing = [name for name in output_parameters if not str(config.get(name) or "").strip()]
+        if missing and require_assignments:
+            raise ValueError("missing native output assignment parameters: " + ", ".join(missing))
+        assigned = [str(config[name]).strip() for name in output_parameters if name not in missing]
+        if assigned:
+            return assigned
+    # Built-in compatibility contracts keep stable default output names, but
+    # the native component still accepts explicit names in var_name/var0/etc.
+    # Honor those assignments so a later {"variable": "..."} reference uses
+    # the same name that the materializer writes into the designer task.
+    native_output_parameters = [
+        str(item).strip()
+        for item in contract.get("native_output_parameters", [])
+        if str(item).strip()
+    ]
+    if (
+        component == "WebBrowser_DataCollectionV5"
+        and not native_output_parameters
+        and str(config.get("collection_stage") or "").strip()
+    ):
+        native_output_parameters = ["var0", "var1", "var2"]
+    canonical_outputs = [str(item).strip() for item in contract.get("outputs", []) if str(item).strip()]
+    if component == "WebBrowser_DataCollectionV5" and str(config.get("collection_output") or "").strip():
+        configured = str(config["collection_output"]).strip()
+        return [configured, *canonical_outputs[1:]] if canonical_outputs else [configured]
+    if native_output_parameters and canonical_outputs:
+        resolved = []
+        for index, default_name in enumerate(canonical_outputs):
+            parameter = native_output_parameters[index] if index < len(native_output_parameters) else ""
+            configured_name = str(config.get(parameter) or "").strip() if parameter else ""
+            resolved.append(configured_name or default_name)
+        return resolved
+    if component == "WebBrowser_RunJsInIeBySelector_v3":
+        output_variable = str(config.get("output_variable") or "").strip()
+        if output_variable:
+            return [output_variable]
+    return canonical_outputs
+
+
+def _normalize_linear_plan_dependencies(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Repair the model-facing dependency chain after an incremental write.
+
+    The native designer task is a linear MAIN_COMPONENT statement list.  Older
+    MCP metadata could retain dependencies for nodes that had since been
+    removed, which made a valid native task fail plan validation as soon as a
+    new database or JSON component was appended.  Incremental authoring has no
+    graph-edit API, so the only truthful representation here is the current
+    native order.
+    """
+    if not steps or not all(
+        isinstance(item, dict) and str(item.get("id") or "").strip() for item in steps
+    ):
+        return steps
+    previous = ""
+    for item in steps:
+        if previous:
+            item["depends_on"] = [previous]
+        else:
+            item.pop("depends_on", None)
+        previous = str(item["id"]).strip()
+    return steps
+
+
+def ensure_native_browser_cleanup_step(
+    paths: ShizaiPaths,
+    project_ref: str,
+    *,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    """Add missing cleanup steps to complete native MCP flows under the write lock."""
+    from .browser_lifecycle import browser_cleanup_steps
+
+    project_dir = resolve_project(paths, project_ref)
+    with _project_write_lock(paths, project_ref):
+        try:
+            state = _native_rpa_state(paths, str(project_dir))
+        except (FileNotFoundError, OSError, ValueError):
+            return {"status": "skipped", "reason": "native_task_not_found", "execution_verified": False}
+        if not state.get("plan_complete"):
+            return {"status": "skipped", "reason": "flow_plan_is_not_complete", "execution_verified": False}
+        _, metadata, _ = _safe_json(project_dir / "szrpa.json")
+        execution_plan = (metadata or {}).get("mcpExecutionPlan") or {}
+        if execution_plan.get("browser_cleanup_policy") == "keep_open":
+            return {"status": "skipped", "reason": "explicit_keep_open", "execution_verified": False}
+        task_path, payload = _native_task_file(project_dir)
+        # Use actual output slots, including assignments from non-browser
+        # components; a cached plan can lag behind manual designer edits.
+        steps = []
+        for step in state["steps"]:
+            node = payload["componentModelEntities"][step["id"]]
+            config = _native_component_config(node)
+            if step["component"].startswith("WebBrowser_CloseWeb"):
+                config["web"] = {"variable": _native_task_argument(node, "web", "")}
+            steps.append({**step, "config": config, "outputs": _native_output_names(node, step["component"])})
+        assessment = browser_cleanup_steps(steps)
+        additions = assessment.pop("steps")
+        # Only auto-generated finalizers are movable during later appends.
+        # An explicit user-authored close must retain its place in the flow.
+        existing_managed = set((metadata or {}).get("mcpBrowserCleanupStepIds") or [])
+        managed_ids = [step["id"] for step in steps if step["id"] in existing_managed]
+        if not additions:
+            return assessment
+        if _live_rpa_contract(paths, "WebBrowser_CloseWeb_V2") is None:
+            assessment.update(status="unavailable", reason="close_component_not_installed")
+            return assessment
+        editor_block = _unsaved_editor_block(project_dir, client)
+        if editor_block is not None:
+            return editor_block
+        for addition in additions:
+            result = _add_native_rpa_step(
+                paths, str(project_dir), addition["component"],
+                step_id=addition["id"], label=addition["purpose"],
+                config=addition["config"], client=client,
+                allow_unbound_predecessors=True,
+            )
+            if not result.get("step_validation", {}).get("valid"):
+                raise ValueError("browser cleanup component failed static validation")
+        _update_native_metadata(project_dir, len(steps) + len(additions), {
+            "mcpAutoCloseBrowser": True, "mcpBrowserCleanupPolicy": "close_created_tab",
+            "mcpBrowserCleanupStepIds": [*managed_ids, *assessment["step_ids"]],
+        })
+        return assessment
 
 
 def _rpa_verification_gate(
@@ -1475,7 +1729,7 @@ def _rpa_next_action(flow: dict[str, Any]) -> dict[str, Any]:
     flow_ref = str(flow.get("flow_ref") or "")
     steps = flow.get("steps") if isinstance(flow.get("steps"), list) else []
     step_count = len(steps)
-    component_plan = flow.get("component_plan") or flow.get("mcpComponentPlan")
+    component_plan, _ = _rpa_component_plan(flow)
     plan_complete = bool(
         flow.get("plan_complete")
         or flow.get("mcpPlanComplete")
@@ -1498,6 +1752,31 @@ def _rpa_next_action(flow: dict[str, Any]) -> dict[str, Any]:
             {},
         )
         role = str(planned.get("element_role") or unbound.get("label") or unbound.get("component") or "").strip()
+        if str(unbound.get("component") or "") == "WebBrowser_DataCollectionV5":
+            required = _result_capture_requirements(
+                flow.get("required_columns") or DEFAULT_RPA_COLUMNS,
+                use_js_link=bool(flow.get("use_js_link")),
+                use_js_table=bool(flow.get("use_js_table")),
+            )
+            fields = [
+                field
+                for field in _RPA_RESULT_FIELD_ORDER
+                if field in required
+            ]
+            return {
+                "kind": "browser_capture",
+                "tool": "shizai_rpa_capture_page_fields",
+                "arguments": {
+                    "project_ref": flow_ref,
+                    "step_id": step_id,
+                    "fields": fields,
+                    "use_js_link": bool(flow.get("use_js_link")),
+                    "allow_write": True,
+                },
+                "step_id": step_id,
+                "component": unbound.get("component"),
+                "reason": "数据采集步骤尚未绑定输出列；在同一次页面快照中捕获同一条记录的全部所需字段。",
+            }
         return {
             "kind": "browser_capture",
             "tool": "shizai_rpa_scan_page",
@@ -1678,16 +1957,32 @@ def _rpa_next_action(flow: dict[str, Any]) -> dict[str, Any]:
         and not bool(flow.get("result_elements_ready"))
         and not bool(flow.get("use_js_table"))
     ):
-        result_fields = ["product_name", "price", "sales"]
-        if not bool(flow.get("use_js_link")):
-            result_fields.insert(1, "merchant")
-        if not bool(flow.get("use_js_link")):
-            result_fields.append("link")
+        required = _result_capture_requirements(
+            flow.get("required_columns") or DEFAULT_RPA_COLUMNS,
+            use_js_link=bool(flow.get("use_js_link")),
+            use_js_table=bool(flow.get("use_js_table")),
+        )
+        result_fields = [
+            field
+            for field in _RPA_RESULT_FIELD_ORDER
+            if field in required
+        ]
         return {
             "kind": "browser_capture",
             "tool": "shizai_rpa_capture_page_fields",
             "arguments": {
                 "project_ref": flow_ref,
+                "step_id": str(
+                    next(
+                        (
+                            item.get("id")
+                            for item in steps
+                            if isinstance(item, dict)
+                            and item.get("component") == "WebBrowser_DataCollectionV5"
+                        ),
+                        "",
+                    )
+                ),
                 "fields": result_fields,
                 "use_js_link": bool(flow.get("use_js_link")),
                 "allow_write": True,
@@ -1987,6 +2282,50 @@ def _project_summary(paths: ShizaiPaths, project_dir: Path) -> dict[str, Any]:
 def list_projects(paths: ShizaiPaths) -> list[dict[str, Any]]:
     """List all local application projects with metadata when available."""
     return [_project_summary(paths, path) for path in iter_application_dirs(paths)]
+
+
+def list_projects_compact(
+    paths: ShizaiPaths,
+    *,
+    query: str = "",
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Find projects from shallow metadata without recursively inspecting every file."""
+    wanted = str(query or "").strip().casefold()
+    maximum = min(50, max(1, int(limit)))
+    matches: list[tuple[float, dict[str, Any]]] = []
+    for project_dir in iter_application_dirs(paths):
+        ok, metadata, _ = _safe_json(project_dir / "szrpa.json")
+        metadata = metadata if ok and isinstance(metadata, dict) else {}
+        summary = {
+            "id": project_dir.name,
+            "path": str(project_dir),
+            "name": metadata.get("packageName") or project_dir.name,
+            "description": metadata.get("description") or "",
+            "mode": metadata.get("projectMode"),
+            "open_mode": metadata.get("openMode"),
+            "factory_version": metadata.get("factoryVersion"),
+            "runtime_version": metadata.get("runtimeVersion"),
+        }
+        haystack = " ".join(str(value or "") for value in summary.values()).casefold()
+        if wanted and wanted not in haystack:
+            continue
+        try:
+            modified = (project_dir / "szrpa.json").stat().st_mtime
+        except OSError:
+            modified = 0.0
+        matches.append((modified, summary))
+    matches.sort(key=lambda item: (item[0], str(item[1]["path"]).casefold()), reverse=True)
+    selected = [summary for _, summary in matches[:maximum]]
+    return {
+        "kind": "shizai_project_list",
+        "query": str(query or "").strip(),
+        "limit": maximum,
+        "count": len(selected),
+        "total": len(matches),
+        "has_more": len(matches) > maximum,
+        "projects": selected,
+    }
 
 
 def create_project(output_dir: str, name: str = "New Shizai Workflow") -> dict[str, Any]:
@@ -2353,7 +2692,9 @@ def _native_selector_css(selector: dict[str, Any]) -> str:
     attributes = [
         (name, value)
         for name, value in target_props
-        if name in _NATIVE_SELECTOR_CSS_ATTRIBUTES and name not in {"name", "role"}
+        if name in _NATIVE_SELECTOR_CSS_ATTRIBUTES
+        and name != "role"
+        and (name != "name" or target_tag.lower() in {"input", "select", "textarea", "button"})
     ]
     if attributes:
         name, value = attributes[0]
@@ -2461,16 +2802,14 @@ def _native_web_selector(element: dict[str, Any], selector: dict[str, Any]) -> d
     selector_items.extend(web_chain)
     result = deepcopy(normalized)
     result["selector"] = selector_items
-    return result
+    return _compact_web_selector(element, result) or result
 
 
 def _compact_web_selector(element: dict[str, Any], selector: dict[str, Any]) -> dict[str, Any] | None:
-    """Build a minimal ``tab > target`` chain from a stable CSS hint."""
+    """Build a minimal ``tab > target`` chain from stable target properties."""
     css = _selector_css({"selector": selector})
-    if not css:
-        return None
-    token = re.split(r"\s*[>+~]\s*|\s+", css.strip())[-1]
-    tag_match = re.match(r"^([A-Za-z][A-Za-z0-9-]*)", token)
+    token = re.split(r"\s*[>+~]\s*|\s+", css.strip())[-1] if css else ""
+    tag_match = re.match(r"^([A-Za-z][A-Za-z0-9-]*)", token) if token else None
     fallback_tag = "div"
     entries = selector.get("selector") if isinstance(selector, dict) else []
     if isinstance(entries, list):
@@ -2483,7 +2822,7 @@ def _compact_web_selector(element: dict[str, Any], selector: dict[str, Any]) -> 
     tag = _NATIVE_SELECTOR_TAGS.get(tag.lower(), tag)
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", tag):
         tag = "div"
-    props = _css_selector_properties(css)
+    props = _css_selector_properties(css) if css else []
     if not props and isinstance(entries, list):
         for item in reversed(entries):
             if not isinstance(item, dict):
@@ -2497,7 +2836,23 @@ def _compact_web_selector(element: dict[str, Any], selector: dict[str, Any]) -> 
                     continue
                 name = str(prop.get("name") or "").strip().lower()
                 value = _selector_property_value(prop)
-                if name in _NATIVE_SELECTOR_CSS_ATTRIBUTES and value and name not in {"name", "role"}:
+                if (
+                    name == "name"
+                    and tag.lower() not in {"input", "select", "textarea", "button"}
+                    and (
+                        isinstance(element.get("mcpNativeSelector"), dict)
+                        or str(element.get("mcpCaptureSource") or "").casefold() == "deep_capture"
+                    )
+                ):
+                    # UIA Name is the accessible text for links and content;
+                    # the web plugin calls this selector property innertext.
+                    name = "innertext"
+                if (
+                    (name in _NATIVE_SELECTOR_CSS_ATTRIBUTES or name == "innertext")
+                    and value
+                    and name != "role"
+                    and (name != "name" or tag.lower() in {"input", "select", "textarea", "button", "a"})
+                ):
                     normalized = _collection_property(name, value, prop)
                     if normalized:
                         props.append(normalized)
@@ -2550,17 +2905,58 @@ def _native_selector_expression(element_id: str, element: dict[str, Any]) -> str
     return ref if is_web else f"elementsFormatNew({ref})"
 
 
-def _native_page_selector_expression(element_id: str) -> str:
-    """Render the DataCollectionV5 page selector expected by RuntimeHost.
-
-    DataCollectionV5 uses ``selector_page`` as a page-context handle, rather
-    than as a field selector. The native designer evaluates that argument
-    through ``elementsFormatNew`` even when the captured element's leaf chain
-    is already a web selector. Keeping this separate from
-    ``_native_selector_expression`` preserves the action-component contract.
-    """
+def _native_page_selector_expression(
+    element_id: str,
+    element: dict[str, Any] | None = None,
+) -> str:
+    """Render a pagination control in DataCollectionV5's formatter contract."""
     ref = f'SHIZAI_ELEMENT_DICT[{json.dumps(str(element_id), ensure_ascii=False)}]["selector"]'
     return f"elementsFormatNew({ref})"
+
+
+def _materialize_collection_paging_selectors(
+    paths: ShizaiPaths,
+    project_ref: str,
+    config: dict[str, Any],
+    *,
+    pending_elements: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve captured pagination element ids to native page selectors."""
+    resolved = dict(config)
+    if pending_elements is not None:
+        elements = pending_elements
+    else:
+        try:
+            _, elements = _element_file(paths, project_ref)
+        except (FileNotFoundError, OSError, ValueError):
+            return resolved
+    element_map = elements.get("elementMap") if isinstance(elements, dict) else None
+    if not isinstance(element_map, dict):
+        return resolved
+    for selector_name in ("selector_page", "selector_more"):
+        selector_value = str(resolved.get(selector_name) or "").strip()
+        if not selector_value:
+            continue
+        if selector_value == MCP_PAGE_SCOPE_ELEMENT_ID:
+            page_scope = element_map.get(selector_value)
+            if isinstance(page_scope, dict):
+                resolved[selector_name] = _native_page_selector_expression(selector_value, page_scope)
+        elif (
+            not selector_value.startswith("elementsFormatNew(")
+            and not selector_value.startswith("SHIZAI_ELEMENT_DICT[")
+            and selector_value in element_map
+        ):
+            page_scope_id = _upsert_page_scope_element(
+                paths,
+                project_ref,
+                selector_value,
+                pending_elements=pending_elements,
+            )
+            resolved[selector_name] = _native_page_selector_expression(
+                page_scope_id,
+                element_map.get(page_scope_id),
+            )
+    return resolved
 
 
 def _collection_paging_settings(config: dict[str, Any] | None = None) -> dict[str, str]:
@@ -2761,6 +3157,8 @@ def _sync_native_collection_config(
             keyword=keyword,
             columns=requested_columns,
             data_attributes=data_attributes,
+            fallback_page_url=page_url,
+            fallback_page_title=page_title,
         )
     if generated is not None and generated_count == len(declared_ids):
         generated_collection = generated.get("collectionConfig") or {}
@@ -2768,7 +3166,13 @@ def _sync_native_collection_config(
         generated_page = generated.get("pageInfo")
         if isinstance(generated_page, dict):
             page_info = deepcopy(base.get("pageInfo")) if isinstance(base.get("pageInfo"), dict) else {}
-            page_info.update(generated_page)
+            page_info.update(
+                {
+                    key: value
+                    for key, value in generated_page.items()
+                    if value not in (None, "") or key not in {"windowTitle", "pageUrl"}
+                }
+            )
             base["pageInfo"] = page_info
     else:
         # No fresh capture is available. Keep existing selectors, but make
@@ -2833,28 +3237,47 @@ def _sync_native_collection_config(
 
 def _selector_page_identity(element: dict[str, Any]) -> tuple[str, str]:
     """Read page URL/title from simplified or native capture records."""
-    title = str(element.get("title") or element.get("page_title") or "").strip()
-    url = str(element.get("url") or element.get("page_url") or "").strip()
-    selector = element.get("selector")
-    if not isinstance(selector, dict):
-        return title, url
-    detail = selector.get("elementDetail")
-    if isinstance(detail, dict) and not title:
-        title = str(detail.get("windowName") or detail.get("categoryName") or "").strip()
-    for entry in selector.get("selector", []):
-        if not isinstance(entry, dict) or str(entry.get("name", "")).lower() not in {"tab", "window", "document"}:
+    fallback_title = str(element.get("title") or element.get("page_title") or "").strip()
+    fallback_url = str(element.get("url") or element.get("page_url") or "").strip()
+
+    # The selector belongs to the exact captured element, whereas the stored
+    # page_title/page_url may come from a window scan. The latter can be a
+    # transient Chrome restore prompt when several windows exist. Read native
+    # selector identity first and use scan metadata only as a fallback.
+    for selector_name in ("mcpNativeSelector", "selector"):
+        selector = element.get(selector_name)
+        if not isinstance(selector, dict):
             continue
-        for raw_prop in entry.get("props", []):
-            prop = _selector_property_dict(raw_prop)
-            if prop is None:
+        selector_title = ""
+        selector_url = ""
+        detail = selector.get("elementDetail")
+        detail_title = (
+            str(detail.get("windowName") or detail.get("categoryName") or "").strip()
+            if isinstance(detail, dict)
+            else ""
+        )
+        for entry in selector.get("selector", []):
+            if not isinstance(entry, dict) or str(entry.get("name", "")).lower() not in {
+                "tab",
+                "window",
+                "document",
+            }:
                 continue
-            name = str(prop.get("name", "")).lower()
-            value = _decode_selector_value(prop.get("textValue") or prop.get("value"))
-            if name in {"title", "name"} and not title:
-                title = value
-            elif name == "url" and not url:
-                url = value
-    return title, url
+            for raw_prop in entry.get("props", []):
+                prop = _selector_property_dict(raw_prop)
+                if prop is None:
+                    continue
+                name = str(prop.get("name", "")).lower()
+                value = _decode_selector_value(prop.get("textValue") or prop.get("value"))
+                if name in {"title", "name"} and value and not selector_title:
+                    selector_title = value
+                elif name == "url" and value and not selector_url:
+                    selector_url = value
+        if selector_title or selector_url:
+            return selector_title or detail_title or fallback_title, selector_url or fallback_url
+        if detail_title:
+            fallback_title = detail_title
+    return fallback_title, fallback_url
 
 
 def _selector_property_names(element: dict[str, Any]) -> tuple[set[str], set[str]]:
@@ -3151,12 +3574,20 @@ def _normalize_native_element_catalog(root: Path) -> list[str]:
     for element_id, element in payload["elementMap"].items():
         if not isinstance(element, dict) or not isinstance(element.get("selector"), dict):
             continue
+        if element.get("mcpPageScope") is True:
+            # DataCollectionV5 passes this selector through elementsFormatNew,
+            # so its values must remain quoted Python expressions.
+            continue
         original = element["selector"]
         normalized = _ensure_native_selector_css(original)
         web_selector = _native_web_selector(element, normalized)
         if web_selector != original:
             if web_selector.get("selector") != normalized.get("selector"):
-                element["mcpNativeSelector"] = normalized
+                # Preserve the first DeepCapture selector. Replacing it with
+                # an already-converted web chain loses Table/DataItem row and
+                # cell semantics on every later materialization.
+                if not isinstance(element.get("mcpNativeSelector"), dict):
+                    element["mcpNativeSelector"] = normalized
                 element["mcpSelectorMode"] = "web"
             element["selector"] = web_selector
             changed.append(str(element_id))
@@ -3191,9 +3622,9 @@ def _native_element(
         result.setdefault("selectorType", "comboSelector")
         result.setdefault("modelType", "Element")
         result.setdefault("GUIType", item.get("gui_type", "Chrome"))
-        if capture_source in {"model_candidate", "deep_capture"}:
+        if capture_source in {"model_candidate", "deep_capture", "browser_bridge"}:
             result["mcpCaptureSource"] = capture_source
-            result["mcpVerificationStatus"] = "verified" if capture_source == "deep_capture" else "unverified"
+            result["mcpVerificationStatus"] = "unverified" if capture_source == "model_candidate" else "verified"
         return result
     gui_type = str(item.get("gui_type") or item.get("GUIType") or "Chrome")
     title = str(item.get("title") or item.get("page_title") or "")
@@ -3251,7 +3682,16 @@ def _native_element(
     selector_items = []
     if tab_props:
         selector_items.append({"name": "tab", "accurate": "true", "props": tab_props})
-    selector_items.append({"name": tag, "type": "web", "accurate": "true", "props": web_props})
+    bridge_chain = _collection_chain_from_css(css) if capture_source == "browser_bridge" else []
+    if bridge_chain:
+        for part in bridge_chain:
+            part["accurate"] = "true"
+            for prop in part.get("props", []):
+                if isinstance(prop, dict):
+                    prop["accurate"] = "true"
+        selector_items.extend(bridge_chain)
+    else:
+        selector_items.append({"name": tag, "type": "web", "accurate": "true", "props": web_props})
     result = {
         "id": element_id,
         "name": str(item.get("name") or element_id),
@@ -3268,9 +3708,11 @@ def _native_element(
         "card_context": item.get("card_context"),
         "link_context": item.get("link_context"),
     }
-    if capture_source in {"model_candidate", "deep_capture"}:
+    if capture_source in {"model_candidate", "deep_capture", "browser_bridge"}:
         result["mcpCaptureSource"] = capture_source
-        result["mcpVerificationStatus"] = "verified" if capture_source == "deep_capture" else "unverified"
+        result["mcpVerificationStatus"] = "unverified" if capture_source == "model_candidate" else "verified"
+    if capture_source == "browser_bridge" and isinstance(item.get("mcpBrowserEvidence"), dict):
+        result["mcpBrowserEvidence"] = dict(item["mcpBrowserEvidence"])
     return result
 
 
@@ -3337,8 +3779,8 @@ def import_elements(
     if not elements:
         raise ValueError("elements must contain at least one captured element")
     capture_source = str(capture_source or "legacy").strip().casefold()
-    if capture_source not in {"legacy", "model_candidate", "deep_capture"}:
-        raise ValueError("capture_source must be legacy, model_candidate, or deep_capture")
+    if capture_source not in {"legacy", "model_candidate", "deep_capture", "browser_bridge"}:
+        raise ValueError("capture_source must be legacy, model_candidate, deep_capture, or browser_bridge")
     _publish_rpa_ui(
         "element_importing",
         "element_import",
@@ -3352,9 +3794,15 @@ def import_elements(
         raise ValueError("captured elements failed validation: " + "; ".join(capture_validation["errors"]))
     capture_validation["capture_source"] = capture_source
     capture_validation["verification_status"] = (
-        "verified" if capture_source == "deep_capture" else "unverified" if capture_source == "model_candidate" else "legacy"
+        "verified"
+        if capture_source in {"deep_capture", "browser_bridge"}
+        else "unverified"
+        if capture_source == "model_candidate"
+        else "legacy"
     )
-    capture_validation["verified_element_count"] = len(elements) if capture_source == "deep_capture" else 0
+    capture_validation["verified_element_count"] = (
+        len(elements) if capture_source in {"deep_capture", "browser_bridge"} else 0
+    )
     capture_validation["unverified_element_count"] = len(elements) if capture_source == "model_candidate" else 0
     element_path, payload = _element_file(paths, project_ref)
     bound_ids = _bound_element_ids_in_project(element_path.parent) if replace else set()
@@ -3429,7 +3877,13 @@ def import_elements(
         "replace": replace,
         "force_replace": force_replace,
         "capture_source": capture_source,
-        "verification_status": "verified" if capture_source == "deep_capture" else "unverified" if capture_source == "model_candidate" else "legacy",
+        "verification_status": (
+            "verified"
+            if capture_source in {"deep_capture", "browser_bridge"}
+            else "unverified"
+            if capture_source == "model_candidate"
+            else "legacy"
+        ),
         "preserved_bound_element_ids": sorted(bound_ids) if replace and not force_replace else [],
         "staged_flow": {
             "phase": staged_flow.get("phase"),
@@ -3440,6 +3894,108 @@ def import_elements(
         "validation": capture_validation,
         "ui_feedback": ui_feedback,
     }
+
+
+def import_verified_reference_elements(
+    paths: ShizaiPaths,
+    project_ref: str,
+    source_project_ref: str,
+    element_ids: list[str],
+    *,
+    replace: bool = False,
+    force_replace: bool = False,
+) -> dict[str, Any]:
+    """Reuse extension-verified elements from another local designer project."""
+    target_dir = resolve_project(paths, project_ref)
+    source_dir = resolve_project(paths, source_project_ref)
+    if target_dir == source_dir:
+        raise ValueError("source_project_ref must identify a different local project")
+
+    normalized_ids = [str(item).strip() for item in element_ids if str(item).strip()]
+    if not normalized_ids:
+        raise ValueError("element_ids must contain at least one id")
+    if len(normalized_ids) != len(set(normalized_ids)):
+        raise ValueError("element_ids contains duplicates")
+
+    _, source_payload = _element_file(paths, str(source_dir))
+    source_map = source_payload.get("elementMap")
+    if not isinstance(source_map, dict):
+        raise ValueError(f"source project has no native element map: {source_dir}")
+
+    records: list[dict[str, Any]] = []
+    for element_id in normalized_ids:
+        element = source_map.get(element_id)
+        if not isinstance(element, dict):
+            raise ValueError(f"verified reference element not found: {element_id}")
+        capture_source, verification_status = _element_verification_state(element)
+        if capture_source != "deep_capture" or verification_status != "verified":
+            raise ValueError(
+                f"reference element {element_id} is not extension-verified "
+                f"(capture_source={capture_source}, verification_status={verification_status})"
+            )
+        record = deepcopy(element)
+        record["id"] = element_id
+        record["mcpReferenceSource"] = {
+            "projectId": source_dir.name,
+            "elementId": element_id,
+        }
+        record["mcpReferenceRuntimeStatus"] = "pending"
+        records.append(record)
+
+    result = import_elements(
+        paths,
+        str(target_dir),
+        records,
+        replace=replace,
+        force_replace=force_replace,
+        capture_source="deep_capture",
+    )
+
+    copied_resources: list[str] = []
+    resource_paths: set[str] = set()
+    for record in records:
+        for selector_name in ("selector", "mcpNativeSelector"):
+            selector = record.get(selector_name)
+            common = selector.get("commonProps") if isinstance(selector, dict) else None
+            if not isinstance(common, dict):
+                continue
+            for field in ("filePath", "resDirPath"):
+                value = str(common.get(field) or "").strip()
+                if value:
+                    resource_paths.add(value)
+    for relative_text in sorted(resource_paths):
+        relative = Path(relative_text.replace("\\", os.sep))
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        source_resource = (source_dir / relative).resolve()
+        try:
+            source_resource.relative_to(source_dir)
+        except ValueError:
+            continue
+        if not source_resource.exists():
+            continue
+        target_resource = target_dir / relative
+        if source_resource.is_dir():
+            shutil.copytree(source_resource, target_resource, dirs_exist_ok=True)
+        else:
+            target_resource.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_resource, target_resource)
+        copied_resources.append(str(relative).replace(os.sep, "/"))
+
+    result.update(
+        {
+            "kind": "verified_reference_elements_imported",
+            "source_project": str(source_dir),
+            "reference_element_ids": normalized_ids,
+            "copied_resources": copied_resources,
+            "runtime_verification_required": True,
+            "message": (
+                "已复用另一个本地流程中由扩展验证的元素；这不是站点硬编码。"
+                "绑定后仍须在当前真实页面单步运行验证。"
+            ),
+        }
+    )
+    return result
 
 
 def validate_project_elements(paths: ShizaiPaths, project_ref: str, *, strict: bool = False) -> dict[str, Any]:
@@ -3543,6 +4099,21 @@ def _has_collection_selector(value: Any) -> bool:
             web_parts.append(part)
         if not web_parts:
             return False
+    web_names = [str(part.get("name") or "").strip().casefold() for part in web_parts]
+    if "table" in web_names and "tr" in web_names and any(name in {"td", "th"} for name in web_names):
+        return True
+    # DataCollectionV5 resolves column paths relative to collectionConfig.tableSelector.
+    # A native table link therefore becomes tr > td > a and may only need
+    # relative indexes; requiring a text/class property here rejects a valid,
+    # reusable selector that RuntimeHost can evaluate for every repeated row.
+    if (
+        "tr" in web_names
+        and any(name in {"td", "th"} for name in web_names)
+        and any(name in {"a", "hyperlink", "link"} for name in web_names)
+    ):
+        return True
+    if "article" in web_names and len(web_parts) >= 2:
+        return True
     for part in web_parts:
         for raw_prop in part.get("props", []):
             prop = _selector_property_dict(raw_prop)
@@ -3656,16 +4227,21 @@ def inspect_rpa_flow(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
     }
 
 
-def validate_rpa_project(paths: ShizaiPaths, project_ref: str, *, strict: bool = False) -> dict[str, Any]:
+def validate_rpa_project(
+    paths: ShizaiPaths, project_ref: str, *, strict: bool = False, publish_ui: bool = True
+) -> dict[str, Any]:
     """Combine element and native task checks for a browser RPA project."""
-    _publish_rpa_ui(
-        "validating",
-        "project_validation",
-        "正在校验设计器项目文件、元素目录和原生任务结构。",
-        animation="project_validation",
-        flow_ref=str(project_ref),
-        strict=bool(strict),
-    )
+    # A read-only preview still wants the real validation result, but must not
+    # drive the designer overlay; only committed writes publish progress.
+    if publish_ui:
+        _publish_rpa_ui(
+            "validating",
+            "project_validation",
+            "正在校验设计器项目文件、元素目录和原生任务结构。",
+            animation="project_validation",
+            flow_ref=str(project_ref),
+            strict=bool(strict),
+        )
     flow = inspect_rpa_flow(paths, project_ref)
     elements = validate_project_elements(paths, project_ref, strict=strict)
     # Page-scoped JavaScript can operate entirely on the live DOM and does
@@ -3712,7 +4288,7 @@ def validate_rpa_project(paths: ShizaiPaths, project_ref: str, *, strict: bool =
             # is also needed here so MCP-managed projects catch collection
             # bindings that are structurally valid JSON but point at a service
             # link or a different product card.
-            flow_contract = validate_rpa_flow(paths, project_ref, strict=False)
+            flow_contract = validate_rpa_flow(paths, project_ref, strict=False, publish_ui=publish_ui)
         except (FileNotFoundError, OSError, ValueError):
             flow_contract = None
     if flow_contract:
@@ -3723,14 +4299,18 @@ def validate_rpa_project(paths: ShizaiPaths, project_ref: str, *, strict: bool =
             if detail not in warnings:
                 warnings.append(detail)
     valid = not errors and (not strict or not warnings)
-    ui_feedback = _publish_rpa_ui(
-        "project_ready" if valid else "validation_failed",
-        "project_validation",
-        "设计器项目校验通过，可以物化或运行。" if valid else "设计器项目校验未通过，请先修复项目和元素问题。",
-        animation="project_complete" if valid else "validation_error",
-        flow_ref=str(resolve_project(paths, project_ref)),
-        valid=valid,
-        next_tool="shizai_rpa_materialize" if valid else "shizai_rpa_validate_project",
+    ui_feedback = (
+        _publish_rpa_ui(
+            "project_ready" if valid else "validation_failed",
+            "project_validation",
+            "设计器项目校验通过，可以物化或运行。" if valid else "设计器项目校验未通过，请先修复项目和元素问题。",
+            animation="project_complete" if valid else "validation_error",
+            flow_ref=str(resolve_project(paths, project_ref)),
+            valid=valid,
+            next_tool="shizai_rpa_materialize" if valid else "shizai_rpa_validate_project",
+        )
+        if publish_ui
+        else None
     )
     return {
         "project": str(resolve_project(paths, project_ref)),
@@ -4031,7 +4611,7 @@ def route_request(query: str) -> dict[str, Any]:
     action_hits = [
         term for term in (
             "生成流程", "创建流程", "自动化", "执行", "操作", "保存", "导出",
-            "读取", "提取", "获取", "整理", "汇总", "去重", "排序", "筛选",
+            "读取", "提取", "获取", "采集", "抓取", "整理", "汇总", "去重", "排序", "筛选",
             "转换", "写入", "替换", "复制", "追加", "删除", "重命名", "等待",
             "检查", "判断", "下载", "上传", "登录", "输入", "点击", "查询",
         ) if term in lowered
@@ -4177,6 +4757,9 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
     This stage extracts evidence and planning obligations. It deliberately
     does not choose a component sequence or generate selectors/JavaScript;
     those decisions belong to the MCP client model after catalog inspection.
+    The analysis does expose a site-neutral stage contract for hierarchical
+    records, so a client model can choose native collection components without
+    first reverse-engineering that requirement from a long script.
     """
     text = str(query or "").strip()
     if not text:
@@ -4188,7 +4771,19 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
     routed = route_request(text)
     if routed["intent"] not in {"browser_rpa", "native_rpa"}:
         raise ValueError(f"request is not an RPA intent: {routed['intent']}")
-    body = re.sub(r"^\s*请?(?:生成|创建|设计)(?:一个|一条)?流程\s*[：:]?\s*", "", text)
+    flow_name_match = re.match(
+        r"^\s*(?:请)?(?:新建|创建|生成|设计)\s*(?:一个|一条)?\s*"
+        r"(?:名为|名称为|名字为)\s*[“\"‘'](?P<name>[^”\"’']+)[”\"’']\s*"
+        r"的?\s*(?:原生\s*)?(?:RPA\s*)?流程\s*[。.!！]?\s*",
+        text,
+        flags=re.IGNORECASE,
+    )
+    flow_name = flow_name_match.group("name").strip() if flow_name_match else None
+    body = (
+        text[flow_name_match.end() :]
+        if flow_name_match
+        else re.sub(r"^\s*请?(?:新建|生成|创建|设计)(?:一个|一条)?流程\s*[：:]?\s*", "", text)
+    )
     # Keep orchestration metadata in the immutable query, but do not turn it
     # into executable RPA operations.  Models often append a flow name or a
     # request for timing reports; those belong to MCP telemetry, not the task
@@ -4235,20 +4830,42 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
         maxsplit=1,
     )[0]
     action_prefix = r"(?:打开|进入|访问|导航到|读取|采集|抓取|提取|获取|整理|汇总|去重|排序|筛选|转换|输出|保存|写入|导出|发送|点击|输入|选择|上传|下载|登录|搜索|查询|检索)"
-    # A comma is a step boundary only when the next text starts another
-    # operation. This preserves field lists and collection constraints such
-    # as "标题、价格和链接，100条结果" as one extraction instruction.
+    url_tokens: dict[str, str] = {}
+
+    def protect_operation_url(match: re.Match[str]) -> str:
+        token = f"__SHIZAI_OPERATION_URL_{len(url_tokens)}__"
+        url_tokens[token] = match.group(0)
+        return token
+
+    protected_operation_body = re.sub(
+        r"https?://[^\s\]\[()<>\"'，,。；;：！？、]+",
+        protect_operation_url,
+        operation_body,
+        flags=re.IGNORECASE,
+    )
+
+    def restore_operation_urls(value: str) -> str:
+        for token, url in url_tokens.items():
+            value = value.replace(token, url)
+        return value
+    # A full stop is always an operation boundary. Commas are boundaries when
+    # the following phrase contains a new action after a short context prefix,
+    # for example ``在首页搜索`` or ``从真实结果页采集``.
     clauses = [
-        item.strip(" 。；;")
+        restore_operation_urls(item.strip(" 。；;"))
         for item in re.split(
-            rf"[；;]|(?:然后|接着|随后)|[，,](?=\s*(?:(?:最终|实际|共|一共|总共)\s*)?{action_prefix})",
-            operation_body,
+            rf"[。.!！；;]|(?:然后|接着|随后)|"
+            rf"[，,](?=\s*(?:(?:最终|实际|共|一共|总共)\s*|(?:在|从)[^，,。；;]{{0,16}}?)?"
+            rf"(?:(?:优先|尽量|尽可能)\s*)?(?:(?:使用|采用)\s*[^，,。；;]{{0,32}}?)?{action_prefix})|"
+            rf"[，,](?=\s*并(?:且)?(?:将)?\s*(?:Excel\s*)?(?:结果|数据)?\s*"
+            rf"(?:输出|保存|写入|导出|发送))",
+            protected_operation_body,
         )
         if item.strip(" 。；;")
     ]
     operations: list[dict[str, Any]] = []
     action_patterns = (
-        ("navigate", r"^(?:打开|进入|访问|导航到)"),
+        ("navigate", r"(?:打开|进入|访问|导航到)"),
         ("extract", r"(?:读取|采集|抓取|提取|获取)"),
         ("transform", r"(?:整理|汇总|去重|排序|筛选|转换)"),
         ("output", r"(?:输出|保存|写入|导出|发送)"),
@@ -4259,7 +4876,8 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
         pieces = [
             item.strip()
             for item in re.split(
-                r"(?<=\S)并(?=(?:(?:最终|实际|共|一共|总共)\s*)?(?:输出|保存|写入|导出|发送))",
+                r"(?<=\S)并(?:且)?(?=\s*(?:将\s*)?(?:Excel\s*)?(?:结果|数据)?\s*"
+                r"(?:输出|保存|写入|导出|发送))",
                 clause,
             )
             if item.strip()
@@ -4287,17 +4905,30 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
     urls = unique_values(
         match.rstrip(".,，。；;：:！？!?、")
         for match in re.findall(
-            r"https?://[^\s\]\[()<>\"'，,。；;：:！？!?、]+",
+            r"https?://[^\s\]\[()<>\"'，,。；;：！？、]+",
             text,
             flags=re.IGNORECASE,
         )
     )
     quoted_values = unique_values(
         value.strip()
-        for pair in re.findall(r"[“\"]([^”\"]+)[”\"]|[‘']([^’']+)[’']", text)
+        for pair in re.findall(r"[“\"]([^”\"]+)[”\"]|[‘']([^’']+)[’']", operation_body)
         for value in pair
         if value.strip()
     )
+    windows_paths = unique_values(
+        match.strip().rstrip("，,。；;：:！？!?")
+        for match in re.findall(r"(?<![\w])(?:[A-Za-z]:\\|\\\\)[^。；;\r\n]+", text)
+    )
+    output_destinations = [
+        path
+        for path in windows_paths
+        if re.search(
+            rf"(?:输出|保存|写入|导出|放在|存到)\s*(?:至|到)?\s*[“\"']?{re.escape(path)}",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ]
     # Keep one numeric completion target even when an orchestration prompt
     # repeats it (for example, "100 条结果" followed by "100 条是最终有效
     # 行数").  Repeated evidence must not become two independent limits in
@@ -4345,7 +4976,7 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
         r"(?:(?:搜索|商品)?结果|列表)?\s*"
         r"(?:中的?|包括|包含|字段为?)?\s*"
         r"([^，,。；;：:！？!?]+)",
-        text,
+        operation_body,
     )
     if collection_field_match:
         candidate = collection_field_match.group(1).strip()
@@ -4377,7 +5008,7 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
             )
     field_match = re.search(
         r"(?:结果|列表|记录|数据)(?:中|中的)?(.+?)(?=[，,；;](?:(?:前|最多|限制为?)?\s*\d+\s*(?:条|项|行)|整理|汇总|取|输出|保存|写入|导出|有必要|必要时|按需|自动|翻页)|[。.]|$)",
-        text,
+        operation_body,
     )
     if field_match and not requested_fields:
         field_text = re.sub(r"^(?:的|包含|包括|字段为?)", "", field_match.group(1).strip())
@@ -4418,6 +5049,56 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
                 "required_capabilities": ["extract", "output"],
                 "mcp_checks": ["selected components exist", "parameters are valid", "output meets the contract"],
             }
+    # A parent/child request needs two page states and two independent native
+    # collection outputs. Keep this record shape generic: it never encodes a
+    # site's DOM, selector, or business-specific workflow.
+    # Keep the shape detector domain-neutral.  The model owns business
+    # meaning (comments, products, tickets, etc.); the core only recognizes
+    # relationship markers that apply to any nested record task.  A plan may
+    # also set ``collection_shape=hierarchical`` when the natural language is
+    # implicit (for example, "each item and its details").
+    parent_terms = re.search(
+        r"(?:一级|第一层|父级|父记录|主记录|上级|primary|parent|master)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    child_terms = re.search(
+        r"(?:二级|第二层|子级|子记录|从属|下级|嵌套|明细|回复|楼中楼|child|detail|reply|nested)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    collection_shape = "hierarchical" if parent_terms and child_terms else "flat"
+    collection_stages = (
+        [
+            {
+                "id": "parent_collection",
+                "kind": "parent",
+                "label": "父记录",
+                "required_capabilities": ["extract", "output"],
+                "page_state": "parent_records_visible",
+                "output_variable": "parent_records",
+                "requires": ["parent_key", "parent_fields"],
+            },
+            {
+                "id": "child_collection",
+                "kind": "child",
+                "label": "子记录",
+                "required_capabilities": ["extract", "output"],
+                "page_state": "child_records_visible",
+                "output_variable": "child_records",
+                "requires": ["parent_key", "child_fields", "parent_step_id"],
+            },
+            {
+                "id": "record_alignment",
+                "kind": "alignment",
+                "label": "父子记录对齐",
+                "preferred_capabilities": ["transform", "output"],
+                "requires": ["parent_key", "child_key", "merge_key"],
+            },
+        ]
+        if collection_shape == "hierarchical"
+        else []
+    )
     analysis_id = "rpa-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
     required_capabilities = ["navigate", "input", "submit", "extract", "output"]
     collection_capabilities = ["extract", "output"]
@@ -4428,6 +5109,19 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
     # the collection step. A model may satisfy pagination with several
     # components or a loop, so do not force it into the catalog query.
     rule_context = rpa_generation_context(text)
+    collection_evidence = {
+        "max_rows": limits[-1]["value"] if limits else None,
+        "pagination": pagination,
+        "completion": (
+            "collect_valid_rows_until_max_rows_or_source_exhaustion"
+            if limits
+            else "use_the_selected_pagination_strategy_when_needed"
+            if pagination
+            else None
+        ),
+    }
+    if collection_shape == "hierarchical":
+        collection_evidence.update({"shape": collection_shape, "stages": collection_stages})
     return {
         "kind": "rpa_request_analysis",
         "analysis_id": analysis_id,
@@ -4436,22 +5130,14 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
         "confidence": routed["confidence"],
         "signals": routed["signals"],
         "evidence": {
+            "flow_name": flow_name,
             "urls": urls,
             "quoted_values": quoted_values,
+            "output_destinations": output_destinations,
             "limits": limits,
             "requested_fields": requested_fields,
             "pagination": pagination,
-            "collection": {
-                "max_rows": limits[-1]["value"] if limits else None,
-                "pagination": pagination,
-                "completion": (
-                    "collect_valid_rows_until_max_rows_or_source_exhaustion"
-                    if limits
-                    else "use_the_selected_pagination_strategy_when_needed"
-                    if pagination
-                    else None
-                ),
-            },
+            "collection": collection_evidence,
             "clauses": clauses,
         },
         "operations": operations,
@@ -4459,7 +5145,10 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
             item
             for item, missing in (
                 ("target_url", not urls and routed["intent"] == "browser_rpa"),
-                ("output_destination", not any(op["type"] == "output" for op in operations)),
+                (
+                    "output_destination",
+                    not output_destinations and not any(op["type"] == "output" for op in operations),
+                ),
                 ("output_fields", not requested_fields),
             )
             if missing
@@ -4558,6 +5247,7 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
                     },
                 },
             ],
+            "collection_stages": collection_stages,
             "recommended_catalog_query": {
                 "scope": "builtin",
                 "capability": ",".join(unique_values(required_capabilities)),
@@ -4566,6 +5256,7 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
                 "limit": 40,
             },
             "collection_decision": {
+                "record_shape": collection_shape,
                 "target_kind": "final_valid_row_count" if limits else None,
                 "requires_pagination": False,
                 "pagination_capability": "discover_from_live_component_catalog",
@@ -4574,6 +5265,11 @@ def analyze_rpa_request(query: str) -> dict[str, Any]:
                 "must_use_single_component": False,
                 "strategy": "model_decides",
                 "no_candidate_action": "let_model_compose_multiple_components_or_report_unmet_contract",
+                "stage_policy": (
+                    "for hierarchical records, use separate native parent and child collection steps, then align"
+                    if collection_shape == "hierarchical"
+                    else "single native collection is sufficient when one repeated record contains all requested fields"
+                ),
             },
             "planner_checkpoint": {
                 "purpose": "为模型提供数量目标、组件能力和页面证据的规划参考，避免遗漏最终输出验收条件。",
@@ -4721,9 +5417,9 @@ def validate_rpa_execution_plan(
             merged_contract = dict(fixed_contract)
             merged_contract.update(catalog_contract)
             catalog_contract = merged_contract
-            # Stable built-in contracts expose logical variable names (for
-            # example "网页对象"). Their native var_name parameter is filled
-            # by the materializer and must not become a second plan output.
+            # Stable built-in contracts expose default logical variable names
+            # (for example "网页对象"). Keep the native assignment slots as
+            # metadata so an explicit var_name can replace that default.
             if "outputs" in fixed_contract:
                 catalog_contract["outputs"] = list(fixed_contract.get("outputs") or [])
                 catalog_contract["output_parameters"] = []
@@ -5058,6 +5754,64 @@ def validate_rpa_execution_plan(
                     )
                 else:
                     raise ValueError("browser RPA first step must provide an explicit http(s) config.url")
+    # Flexible plans may omit operation_ids, but an explicit page interaction
+    # still needs a component that can perform it. Infer coverage from the live
+    # component contracts, then reject plans that would open and collect from
+    # the unmodified page.
+    missing_interactions: list[str] = []
+    for operation_id in sorted(operation_ids - covered_operations):
+        operation_type = operation_types.get(operation_id)
+        if operation_type not in {"search", "interact"}:
+            continue
+        implementation = next(
+            (
+                step
+                for step in normalized_steps
+                if operation_type
+                in set(component_contracts[step["component"]].get("operation_types") or [])
+            ),
+            None,
+        )
+        if implementation is None and operation_type == "search":
+            implementation = next(
+                (
+                    step
+                    for step in normalized_steps
+                    if "navigate"
+                    in set(component_contracts[step["component"]].get("operation_types") or [])
+                    and re.search(
+                        r"(?:[?&](?:q|query|keyword|wd|search|term)=|/search(?:[/?#]|$))",
+                        str(step["config"].get("url") or ""),
+                        re.IGNORECASE,
+                    )
+                ),
+                None,
+            )
+        if implementation is None:
+            instruction = next(
+                (
+                    str(item.get("instruction") or "").strip()
+                    for item in analysis.get("operations", [])
+                    if isinstance(item, dict) and str(item.get("id")) == operation_id
+                ),
+                "",
+            )
+            missing_interactions.append(
+                f"{operation_id} ({operation_type})" + (f": {instruction}" if instruction else "")
+            )
+            continue
+        implementation["operation_ids"].append(operation_id)
+        covered_operations.add(operation_id)
+        normalization_warnings.append(
+            f"operation {operation_id} was mapped to {implementation['id']} from its live interaction contract"
+        )
+    if missing_interactions:
+        raise ValueError(
+            "plan does not implement analyzed page interactions: "
+            + "; ".join(missing_interactions)
+            + "; add installed input/submit-capable component steps or an explicit search-result URL"
+        )
+
     # A structured collection component may own the output operation as part
     # of its contract.  Client models sometimes split the final "输出" clause
     # into a synthetic extra operation even though no separate output step is
@@ -5370,9 +6124,10 @@ def _mcp_component_contracts(
                 live = _catalog_rpa_contract(component, record)
                 merged = dict(base)
                 merged.update(live)
-                # Keep stable logical output names for built-in components;
-                # dynamic components retain the output parameters from the
-                # live catalog.
+                # Keep stable default output names for built-in components;
+                # native_output_parameters still lets explicit assignments
+                # replace those defaults. Dynamic components retain live
+                # output parameters as required plan configuration.
                 if base.get("outputs"):
                     merged["outputs"] = list(base.get("outputs") or [])
                     merged["output_parameters"] = []
@@ -5399,6 +6154,341 @@ def _mcp_component_contracts(
     installed = {str(item).strip() for item in available_components if str(item).strip()}
     contracts = {name: dict(compatibility[name]) for name in installed if name in compatibility}
     return contracts, installed
+
+
+def _bind_unambiguous_plan_inputs(
+    *,
+    step_id: str,
+    component: str,
+    contract: dict[str, Any],
+    config: dict[str, Any],
+    inputs: list[str],
+    available_variables: set[str],
+    variable_types: dict[str, set[str]],
+) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+    """Map logical step inputs to native parameters when the live contract is unambiguous."""
+    missing = [name for name in inputs if name not in available_variables]
+    if missing:
+        raise ValueError(
+            f"plan step {step_id} references inputs without a preceding producer: {missing}"
+        )
+    if contract.get("_catalog_metadata_missing"):
+        return config, []
+    explicitly_bound = {
+        str(value.get("variable") or "").strip()
+        for value in config.values()
+        if isinstance(value, dict) and set(value) == {"variable"}
+    }
+    remaining_variables = [name for name in inputs if name not in explicitly_bound]
+    if not remaining_variables:
+        return config, []
+
+    output_parameters = {
+        str(item).strip()
+        for key in ("output_parameters", "native_output_parameters")
+        for item in contract.get(key, [])
+        if str(item).strip()
+    }
+    deferred = {str(item).strip() for item in contract.get("deferred_bindings", []) if str(item).strip()}
+    candidate_parameters = [
+        str(item).split("=", 1)[0].strip()
+        for item in contract.get("inputs", [])
+        if str(item).split("=", 1)[0].strip()
+        and str(item).split("=", 1)[0].strip() not in output_parameters
+        and str(item).split("=", 1)[0].strip() not in deferred
+        and config.get(str(item).split("=", 1)[0].strip()) in (None, "")
+    ]
+    parameter_types = contract.get("parameter_types", {})
+    matches: dict[str, list[str]] = {}
+    for variable in remaining_variables:
+        actual_types = variable_types.get(variable, set())
+        typed_matches = [
+            parameter
+            for parameter in candidate_parameters
+            if actual_types
+            and set(parameter_types.get(parameter, []))
+            and not actual_types.isdisjoint(set(parameter_types.get(parameter, [])))
+        ]
+        matches[variable] = typed_matches or [
+            parameter
+            for parameter in candidate_parameters
+            if not actual_types or not set(parameter_types.get(parameter, []))
+        ]
+    bindings: list[tuple[str, str]] = []
+    pending = list(remaining_variables)
+    while pending:
+        selected: tuple[str, str] | None = next(
+            (
+                (variable, choices[0])
+                for variable in pending
+                if len(choices := [item for item in matches[variable] if item in candidate_parameters]) == 1
+            ),
+            None,
+        )
+        if selected is None:
+            unique_parameters = [
+                parameter
+                for parameter in candidate_parameters
+                if sum(parameter in matches[variable] for variable in pending) == 1
+            ]
+            if unique_parameters:
+                parameter = unique_parameters[0]
+                variable = next(item for item in pending if parameter in matches[item])
+                selected = (variable, parameter)
+        if selected is None:
+            choices = {variable: matches[variable] for variable in pending}
+            raise ValueError(
+                f"plan step {step_id} cannot map inputs {pending} to {component} parameters unambiguously; "
+                f"candidate parameters: {choices}. Set config.<parameter>={{\"variable\":\"name\"}} explicitly"
+            )
+        variable, parameter = selected
+        config[parameter] = {"variable": variable}
+        bindings.append((variable, parameter))
+        pending.remove(variable)
+        candidate_parameters.remove(parameter)
+    return config, bindings
+
+
+def _native_collection_review(
+    analysis: dict[str, Any] | None,
+    steps: list[dict[str, Any]],
+    contracts: dict[str, dict[str, Any]],
+    installed: set[str] | None,
+    plan: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Review native collection stages without claiming page compatibility."""
+    if not isinstance(analysis, dict) or analysis.get("intent") != "browser_rpa":
+        return None
+    operations = analysis.get("operations") if isinstance(analysis.get("operations"), list) else []
+    operation_types = {
+        str(item.get("type") or "").strip().casefold()
+        for item in operations
+        if isinstance(item, dict)
+    }
+    evidence = analysis.get("evidence") if isinstance(analysis.get("evidence"), dict) else {}
+    requested_fields = evidence.get("requested_fields")
+    requests_collection = bool({"extract", "collect", "scrape"} & operation_types) or bool(
+        isinstance(requested_fields, list) and requested_fields
+    )
+    if not requests_collection:
+        return None
+    collection_evidence = evidence.get("collection") if isinstance(evidence.get("collection"), dict) else {}
+    record_shape = str(collection_evidence.get("shape") or "flat").strip().casefold()
+    plan_shape = str(
+        (plan or {}).get("collection_shape")
+        or (plan or {}).get("record_shape")
+        or ""
+    ).strip().casefold()
+    if plan_shape in {"flat", "hierarchical"}:
+        record_shape = plan_shape
+    expected_stages = collection_evidence.get("stages")
+    if not isinstance(expected_stages, list):
+        expected_stages = []
+    expected_stage_ids = [
+        str(item.get("id") or "").strip()
+        for item in expected_stages
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+
+    # Compatibility defaults alone are not evidence of installed components.
+    if installed is None:
+        return {
+            "status": "catalog_unchecked", "runtime_verified": False,
+            "model_directive": "尚未提供实时组件目录；先查询原生采集契约，再选择采集方案。",
+        }
+    candidates: list[str] = []
+    for component, contract in contracts.items():
+        if not isinstance(contract, dict) or contract.get("materializable") is False:
+            continue
+        capabilities = {str(item).casefold() for item in contract.get("capabilities") or []}
+        if "extract" in capabilities and "output" in capabilities:
+            candidates.append(str(component))
+    candidates.sort(key=lambda name: ("datacollection" not in name.casefold(), name.casefold()))
+    selected: list[str] = []
+    selected_steps: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        component = str(step.get("component") or "").strip()
+        contract = contracts.get(component) or {}
+        capabilities = {str(item).casefold() for item in contract.get("capabilities") or []}
+        if "extract" in capabilities:
+            selected.append(component)
+            selected_steps.append(step)
+    native_selected = next((component for component in selected if component in candidates), None)
+    native_steps = [
+        step
+        for step in selected_steps
+        if str(step.get("component") or "").strip() in candidates
+    ]
+    selected_stage_ids: list[str] = []
+    selected_stage_outputs: list[str] = []
+    child_parent_refs: list[str] = []
+    for step in native_steps:
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        stage = (
+            step.get("collection_stage")
+            or step.get("collection_role")
+            or config.get("collection_stage")
+            or config.get("collection_role")
+        )
+        stage = str(stage or "").strip()
+        if stage:
+            selected_stage_ids.append(stage)
+        output = config.get("output_file") or config.get("var0") or config.get("output_variable")
+        if not output and isinstance(step.get("outputs"), list) and step.get("outputs"):
+            output = step.get("outputs")[0]
+        output = str(output or "").strip()
+        if output:
+            selected_stage_outputs.append(output)
+        if stage == "child_collection":
+            child_parent_refs.append(
+                str(step.get("parent_step_id") or config.get("parent_step_id") or "").strip()
+            )
+    alignment_steps: list[dict[str, Any]] = []
+    alignment_keys = [
+        str(
+            step.get("merge_key")
+            or (step.get("config") or {}).get("merge_key")
+            or ""
+        ).strip()
+        for step in steps
+        if isinstance(step, dict)
+        and (
+            str(step.get("collection_stage") or "").strip() == "record_alignment"
+            or str((step.get("config") or {}).get("collection_stage") or "").strip() == "record_alignment"
+        )
+    ]
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        config = step.get("config") if isinstance(step.get("config"), dict) else {}
+        stage = str(step.get("collection_stage") or config.get("collection_stage") or "").strip()
+        if stage == "record_alignment":
+            alignment_steps.append(step)
+    alignment_capabilities = sorted(
+        {
+            str(capability).casefold()
+            for step in alignment_steps
+            for capability in (contracts.get(str(step.get("component") or "").strip(), {}) or {}).get("capabilities", [])
+        }
+    )
+    review = {
+        "available_candidates": candidates[:5],
+        "selected_extract_components": selected,
+        "record_shape": record_shape,
+        "expected_stages": expected_stage_ids,
+        "selected_native_stages": selected_stage_ids,
+        "selected_stage_outputs": selected_stage_outputs,
+        "child_parent_refs": child_parent_refs,
+        "alignment_keys": alignment_keys,
+        "alignment_capabilities": alignment_capabilities,
+        "runtime_verified": False,
+    }
+    if record_shape == "hierarchical":
+        # A long script is especially risky for parent/child data: it tends to
+        # collapse the two page states into one timeout-prone extraction. Make
+        # the native staged choice explicit in the model-visible review.
+        parent_present = "parent_collection" in selected_stage_ids
+        child_present = "child_collection" in selected_stage_ids
+        alignment_present = bool(
+            alignment_steps
+            and set(alignment_capabilities).intersection({"transform", "output"})
+        )
+        stage_outputs_distinct = len(selected_stage_outputs) >= 2 and len(set(selected_stage_outputs)) >= 2
+        child_reference_present = bool(child_parent_refs and all(child_parent_refs))
+        alignment_key_present = bool(alignment_keys and all(alignment_keys))
+        if not candidates:
+            return {
+                **review,
+                "status": "no_candidate",
+                "recommended_component": None,
+                "model_directive": (
+                    "层级采集需要原生父记录/子记录阶段，但当前实时目录没有可物化的 extract+output 候选；"
+                    "先补查目录或报告能力缺口，不能退化成一个未验证的大脚本。"
+                ),
+            }
+        if not native_steps:
+            return {
+                **review,
+                "status": "stage_plan_required",
+                "recommended_component": candidates[0],
+                "model_directive": (
+                    "检测到父子记录；必须设计 parent_collection、child_collection 两个独立的 "
+                    f"{candidates[0]} 步骤，并增加 record_alignment/输出步骤。"
+                    "页面展开、切换父记录和分页可以由短动作组件或短脚本补足；不能用一个长 JS 同时抓两层。"
+                ),
+            }
+        if not (
+            parent_present
+            and child_present
+            and len(set(selected_stage_ids)) >= 2
+            and alignment_present
+            and stage_outputs_distinct
+            and child_reference_present
+            and alignment_key_present
+        ):
+            return {
+                **review,
+                "status": "stage_plan_required",
+                "recommended_component": candidates[0],
+                "model_directive": (
+                    "层级采集的原生阶段尚未完整：分别声明 collection_stage=parent_collection 和 "
+                    "collection_stage=child_collection，使用不同输出变量/字段绑定/文件，并补上 "
+                    "record_alignment（声明 parent_step_id 与 merge_key）后再运行。"
+                ),
+            }
+        return {
+            **review,
+            "status": "native_staged",
+            "recommended_component": candidates[0],
+            "model_directive": (
+                "已声明父记录、子记录和对齐阶段；分别在当前页面状态执行两个原生采集预览，"
+                "确认 parent_step_id/merge_key 对齐、非空行和输出文件互不覆盖后再运行。"
+            ),
+        }
+    if native_selected:
+        return {
+            **review,
+            "status": "native_selected",
+            "recommended_component": native_selected,
+            "model_directive": (
+                f"已选择原生采集候选 {native_selected}，尚未验证页面兼容性；绑定当前页面字段并执行原生预览，"
+                "核对非空行、字段对应关系和完整性后再运行。"
+            ),
+        }
+    if not candidates:
+        return {
+            **review,
+            "status": "no_candidate",
+            "recommended_component": None,
+            "model_directive": (
+                "本次提供的目录中没有可物化的 extract+output 候选；补查目录，"
+                "依据实际契约和页面证据组合组件，并报告能力缺口。"
+            ),
+        }
+    # An initial navigation-only skeleton has not made an extraction choice.
+    if not selected:
+        return {**review, "status": "selection_pending", "recommended_component": candidates[0],
+                "model_directive": "采集尚未设计；取得页面后评估原生采集候选，允许先保存导航骨架。"}
+    reasons = {
+        step["id"]: step["native_alternative_reason"].strip()
+        for step in steps if step.get("component") in selected
+        and isinstance(step.get("native_alternative_reason"), str) and step["native_alternative_reason"].strip()
+    }
+    if reasons:
+        return {**review, "status": "reason_recorded", "recommended_component": candidates[0],
+                "model_reported_reasons": reasons,
+                "model_directive": "已记录模型报告的替代原因；原因文本不是验证证据，仍需核对真实页面及输出。"}
+    return {
+        **review,
+        "status": "required_review",
+        "recommended_component": candidates[0],
+        "model_directive": (
+            f"尚未选择原生采集候选 {candidates[0]}；必须先比较其契约和当前页面，适用时优先使用。"
+            "替代时在步骤 native_alternative_reason 中记录具体限制与验证证据；不能因脚本容易生成而跳过。"
+        ),
+    }
 
 
 def validate_mcp_rpa_plan(
@@ -5437,7 +6527,9 @@ def validate_mcp_rpa_plan(
     semantic_aliases = {
         "output_file", "output_path", "file_path", "destination", "file", "filename", "filename_suffix",
         "columns", "max_rows", "pagination", "data_attributes", "output_variable", "outputVariable",
-        "output_columns", "result_mode", "page_scope", "element_ids",
+        "output_columns", "result_mode", "page_scope", "element_ids", "collection_stage",
+        "collection_role", "parent_step_id", "merge_key", "native_alternative_reason",
+        "var0", "var1", "var2", "collection_output",
     }
     normalized_steps: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -5468,6 +6560,25 @@ def validate_mcp_rpa_plan(
             config = {}
         if not isinstance(config, dict):
             raise ValueError(f"plan step {step_id}.config must be an object")
+        config = dict(config)
+        if component == "WebBrowser_DataCollectionV5":
+            collection_stage = _collection_stage_value(step)
+            if collection_stage:
+                config["collection_stage"] = collection_stage
+        inputs = [str(item).strip() for item in step.get("inputs", []) if str(item).strip()]
+        config, inferred_input_bindings = _bind_unambiguous_plan_inputs(
+            step_id=step_id,
+            component=component,
+            contract=contract,
+            config=config,
+            inputs=inputs,
+            available_variables=available_variables,
+            variable_types=variable_types,
+        )
+        warnings.extend(
+            f"plan step {step_id} input {variable} was bound to config.{parameter} from the live component contract"
+            for variable, parameter in inferred_input_bindings
+        )
         parameter_names = set(str(item).strip() for item in contract.get("parameter_names", []) if str(item).strip())
         if not parameter_names:
             for item in (*contract.get("inputs", []), *contract.get("options", [])):
@@ -5495,6 +6606,18 @@ def validate_mcp_rpa_plan(
             expected_types = set(contract.get("parameter_types", {}).get(config_name, []))
             handle_input = (expected_types and all(t.startswith("handle:") for t in expected_types)
                             and config_name not in contract.get("native_output_parameters", []))
+            if (
+                isinstance(config_value, dict)
+                and set(config_value) == {"variable"}
+                and (component in _NATIVE_RPA_COMPONENTS or handle_input)
+            ):
+                variable = config_value["variable"]
+                if not isinstance(variable, str) or variable not in available_variables:
+                    raise ValueError(
+                        f"plan step {step_id} config.{config_name}: variable {variable!r} "
+                        "has no preceding producer in this plan; select a component whose live contract "
+                        "declares that output and place it before this step"
+                    )
             if handle_input and not is_reference:
                 raise ValueError(
                     f"plan step {step_id} config.{config_name} requires a runtime object {sorted(expected_types)}, "
@@ -5502,13 +6625,6 @@ def validate_mcp_rpa_plan(
                     'then reference its output with {"variable":"output_name"} and execute that producer '
                     "before using the object or inspecting its page"
                 )
-            if handle_input and isinstance(config_value, dict) and set(config_value) == {"variable"}:
-                variable = config_value["variable"]
-                if not isinstance(variable, str) or variable not in available_variables:
-                    raise ValueError(
-                        f"plan step {step_id} config.{config_name}: runtime object variable {variable!r} "
-                        "has no preceding producer in this plan; create or obtain the object first"
-                    )
             if component not in _NATIVE_RPA_COMPONENTS and isinstance(config_value, dict) and set(config_value) == {"variable"}:
                 variable = config_value["variable"]
                 actual_types = variable_types.get(variable, set()) if isinstance(variable, str) else set()
@@ -5554,36 +6670,49 @@ def validate_mcp_rpa_plan(
             invalid_elements = [item for item in step.get("element_ids") or [] if not str(item).strip()]
             if invalid_elements:
                 raise ValueError(f"plan step {step_id}.element_ids contains an empty id")
-        # An omitted output list means the model did not spell out the native
-        # contract, so materialize the stable outputs before the plan reaches
-        # validate_rpa_step.  An explicit [] is different: it is an intentional
-        # assertion and must remain visible for the later static validator.
-        outputs_supplied = "outputs" in step and step.get("outputs") is not None
-        if not outputs_supplied:
-            expected_outputs = [
-                str(item).strip() for item in contract.get("outputs", []) if str(item).strip()
-            ]
-            for parameter in contract.get("output_parameters", []) or []:
-                output_name = str(config.get(parameter) or "").strip()
-                if output_name:
-                    expected_outputs.append(output_name)
-            if expected_outputs:
-                step["outputs"] = expected_outputs
-                warnings.append(
-                    f"plan step {step_id} omitted outputs; filled from the native component contract"
-                )
+        # outputs is derived data. Native catalog names such as var_name/var0
+        # identify assignment slots; the values configured in those slots are
+        # logical variables. Keeping both representations model-editable caused
+        # plans that passed preflight but could never pass native validation.
+        output_parameters = [
+            str(item).strip() for item in contract.get("output_parameters", []) if str(item).strip()
+        ]
+        try:
+            expected_outputs = _logical_plan_outputs(
+                component,
+                contract,
+                config,
+                require_assignments=component in _NATIVE_RPA_COMPONENTS,
+            )
+        except ValueError as exc:
+            raise ValueError(f"plan step {step_id} {exc}") from exc
+        supplied_outputs = [str(item).strip() for item in step.get("outputs", []) if str(item).strip()]
+        if supplied_outputs != expected_outputs:
+            native_slots = {
+                str(item).strip()
+                for item in contract.get("native_output_parameters", [])
+                if str(item).strip()
+            }
+            copied_native_slots = bool(supplied_outputs) and set(supplied_outputs).issubset(native_slots)
+            reason = "copied native assignment slots" if copied_native_slots else "differed from the live contract"
+            warnings.append(
+                f"plan step {step_id} outputs {reason}; MCP generated logical outputs {expected_outputs}"
+            )
+        step["outputs"] = expected_outputs
         # Reassignment must forget previous type knowledge, including outputs
         # whose type is conditional, unknown, or handled by compatibility code.
         for output in step.get("outputs") or []:
             if isinstance(output, str):
                 variable_types.pop(output, None)
                 available_variables.add(output)
-        for parameter in contract.get("output_parameters", []) or []:
-            output = config.get(parameter)
+        assignment_parameters = output_parameters or [
+            str(item).strip()
+            for item in contract.get("native_output_parameters", [])
+            if str(item).strip()
+        ]
+        for output, parameter in zip(step.get("outputs") or [], assignment_parameters):
             if isinstance(output, str) and output:
-                available_variables.add(output)
-                variable_types[output] = (set(contract.get("parameter_types", {}).get(parameter, []))
-                                          if component not in _NATIVE_RPA_COMPONENTS else set())
+                variable_types[output] = set(contract.get("parameter_types", {}).get(parameter, []))
         step.update({"id": step_id, "order": index, "component": component, "config": config})
         normalized_steps.append(step)
         seen_ids.add(step_id)
@@ -5613,10 +6742,23 @@ def validate_mcp_rpa_plan(
             "output_contract": dict(output_contract),
         }
     )
+    normalized_plan.pop("plan_id", None)
     normalized_plan["plan_id"] = (
         "plan-"
         + hashlib.sha256(json.dumps(normalized_plan, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
     )
+    native_collection_review = _native_collection_review(
+        analysis,
+        normalized_steps,
+        contracts,
+        installed,
+        normalized_plan,
+    )
+    if native_collection_review and native_collection_review.get("status") in {
+        "required_review",
+        "stage_plan_required",
+    }:
+        warnings.append(str(native_collection_review.get("model_directive") or ""))
     return {
         "kind": "validated_rpa_execution_plan",
         "valid": True,
@@ -5625,6 +6767,7 @@ def validate_mcp_rpa_plan(
         "live_catalog_validated": installed is not None,
         "constraint_coverage": {"limit_steps": [], "pagination_steps": []},
         "normalization_warnings": warnings,
+        "native_collection_review": native_collection_review,
         "policy": {
             "mode": "model_decides",
             "strategy_checks": "none",
@@ -5645,7 +6788,8 @@ def preflight_rpa_execution_plan(
     """Return a fast, non-throwing plan preflight for MCP clients."""
     started = time.perf_counter()
     normalized_policy = str(planning_policy).strip().casefold()
-    thin_mcp_policy = normalized_policy in {"mcp", "mcp_thin", "thin"}
+    native_first_policy = normalized_policy in {"native_first", "mcp_native", "native"}
+    thin_mcp_policy = normalized_policy in {"mcp", "mcp_thin", "thin"} or native_first_policy
     try:
         effective_plan = dict(plan) if isinstance(plan, dict) else plan
         if isinstance(effective_plan, dict) and normalized_policy in {
@@ -5669,6 +6813,35 @@ def preflight_rpa_execution_plan(
                 effective_plan,
                 available_components=available_components,
             )
+        # The public MCP authoring path uses ``native_first``.  Keep the
+        # generic thin validator model-owned for compatibility, but make a
+        # hierarchical collection plan a real gate before start_design writes
+        # a native task.  Otherwise a model can acknowledge the review and
+        # still persist one large JavaScript extractor for parent/child data.
+        review = validated.get("native_collection_review") if isinstance(validated, dict) else None
+        if (
+            native_first_policy
+            and validated.get("valid")
+            and isinstance(review, dict)
+            and review.get("status") == "stage_plan_required"
+        ):
+            directive = str(review.get("model_directive") or "").strip()
+            return {
+                **validated,
+                "kind": "rpa_plan_preflight",
+                "valid": False,
+                "error_code": "collection_stage_plan_required",
+                "error": directive or "层级采集必须先补齐父记录、子记录和对齐阶段。",
+                "correction": (
+                    "保留原始 query、analysis_id 和当前页面证据；补齐两个独立的 "
+                    "WebBrowser_DataCollectionV5 阶段（parent_collection、child_collection）以及 "
+                    "record_alignment，再重新调用 shizai_rpa_validate_plan。"
+                ),
+                "do_not_reanalyze_original_query": True,
+                "next_tool": "shizai_rpa_validate_plan",
+                "policy": {"mode": "native_first", "strategy_checks": "hierarchical_native_gate"},
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+            }
     except (TypeError, ValueError) as exc:
         message = str(exc)
         lowered = message.casefold()
@@ -5696,10 +6869,12 @@ def preflight_rpa_execution_plan(
             "do_not_reanalyze_original_query": True,
             "next_tool": "shizai_rpa_validate_plan",
             "policy": {
-                "mode": "model_decides"
+                "mode": "native_first"
+                if native_first_policy
+                else "model_decides"
                 if normalized_policy in {"flexible", "advisory", "model_decides", "mcp", "mcp_thin", "thin"}
                 else "legacy_strict",
-                "strategy_checks": "none" if thin_mcp_policy else "advisory"
+                "strategy_checks": "hierarchical_native_gate" if native_first_policy else "none" if thin_mcp_policy else "advisory"
                 if normalized_policy in {"flexible", "advisory", "model_decides"}
                 else "enforced",
             },
@@ -5711,11 +6886,15 @@ def preflight_rpa_execution_plan(
         "do_not_reanalyze_original_query": True,
         "next_tool": "shizai_rpa_start_design",
         "policy": {
-            "mode": "model_decides"
+            "mode": "native_first"
+            if native_first_policy
+            else "model_decides"
             if normalized_policy in {"flexible", "advisory", "model_decides", "mcp", "mcp_thin", "thin"}
             else "legacy_strict",
             "strategy_checks": (
-                "none"
+                "hierarchical_native_gate"
+                if native_first_policy
+                else "none"
                 if thin_mcp_policy
                 else "advisory"
                 if normalized_policy in {"flexible", "advisory", "model_decides"}
@@ -6384,13 +7563,111 @@ def _adapt_rpa_component_config(component: str, config: dict[str, Any], flow: di
     return adapted
 
 
-def _guard_rpa_append_structure(steps: list[dict[str, Any]], component: str) -> None:
-    """Reject append operations that create an ambiguous native task tree."""
+def _sqlite_database_path(config: dict[str, Any], *, project_dir: Path | None = None) -> Path | None:
+    """Resolve a concrete local SQLite file from a semantic DB component config."""
+    if not isinstance(config, dict):
+        return None
+    dtype = _decode_selector_value(config.get("dtype", ""))
+    if dtype != "4":
+        return None
+    database_config = config.get("DatabaseConfig")
+    if isinstance(database_config, str):
+        encoded = _decode_selector_value(database_config)
+        try:
+            database_config = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    if isinstance(database_config, dict):
+        database_config = [database_config]
+    if not isinstance(database_config, list):
+        return None
+    raw_path: Any = None
+    for item in database_config:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "").strip().casefold() in {"filepath", "file_path"}:
+            raw_path = item.get("value")
+            break
+    if isinstance(raw_path, (dict, list, tuple)):
+        return None
+    text = _decode_selector_value(raw_path).strip()
+    if not text or text.startswith("$") or text.casefold() in {"none", "null"}:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        if project_dir is None:
+            return None
+        path = (project_dir / path).resolve()
+    return path
+
+
+def _ensure_sqlite_database_file(
+    config: dict[str, Any], *, project_dir: Path | None = None
+) -> dict[str, Any]:
+    """Create a local SQLite file before RuntimeHost opens it.
+
+    RuntimeHost's Database_DBConnect component reports ``CantOpen (14)``
+    when the configured file or parent directory does not exist.  The native
+    component does not create either one, so MCP prepares concrete local
+    SQLite paths at the authoring and run boundaries.  Variable/expression
+    paths are deliberately skipped because their value is only known inside
+    the runtime.
+    """
+    path = _sqlite_database_path(config, project_dir=project_dir)
+    if path is None:
+        return {"prepared": False, "path": None}
+    try:
+        if path.exists() and path.is_dir():
+            raise OSError("configured SQLite path is a directory")
+        existed = path.is_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(path)):
+            pass
+    except (OSError, sqlite3.Error) as exc:
+        raise ValueError(f"SQLite database file cannot be prepared: {path}: {exc}") from exc
+    return {"prepared": True, "created": not existed, "path": str(path)}
+
+
+def _collection_stage_value(step: dict[str, Any] | None) -> str:
+    if not isinstance(step, dict):
+        return ""
+    config = step.get("config") if isinstance(step.get("config"), dict) else {}
+    return str(
+        step.get("collection_stage")
+        or step.get("collection_role")
+        or step.get("mcpCollectionStage")
+        or config.get("collection_stage")
+        or config.get("collection_role")
+        or ""
+    ).strip()
+
+
+def _guard_rpa_append_structure(
+    steps: list[dict[str, Any]],
+    component: str,
+    config: dict[str, Any] | None = None,
+) -> None:
+    """Reject ambiguous collection appends while allowing explicit stages.
+
+    A plain flow still has one final collection node. A model-owned
+    hierarchical plan may add multiple native collectors only when every
+    collector carries a distinct ``collection_stage`` (for example
+    ``parent_collection`` and ``child_collection``). This keeps accidental
+    duplicate appends blocked while making the intended two-pass design
+    materializable.
+    """
     components = [str(item.get("component") or "") for item in steps if isinstance(item, dict)]
     if component == "WebBrowser_DataCollectionV5" and "WebBrowser_DataCollectionV5" in components:
-        raise ValueError(
-            "designer_state_conflict: WebBrowser_DataCollectionV5 already exists; update or rebind it instead of adding a second collection step"
-        )
+        requested_stage = _collection_stage_value({"config": config or {}})
+        existing_stages = [
+            _collection_stage_value(item)
+            for item in steps
+            if isinstance(item, dict) and item.get("component") == "WebBrowser_DataCollectionV5"
+        ]
+        if not requested_stage or not all(existing_stages) or requested_stage in existing_stages:
+            raise ValueError(
+                "designer_state_conflict: WebBrowser_DataCollectionV5 already exists; update or rebind it instead of adding a second collection step"
+            )
     if component == "WebBrowser_DataCollectionV5" and any(item.startswith("Excel_") for item in components):
         raise ValueError(
             "designer_state_conflict: data collection must be completed before the Excel output chain; do not append collection after Excel steps"
@@ -6431,6 +7708,14 @@ def repair_native_rpa_flow(
     ]
     if len(collection_ids) <= 1:
         raise ValueError("native flow does not contain duplicate WebBrowser_DataCollectionV5 nodes")
+    staged_ids = [
+        _collection_stage_value(entities.get(node_id))
+        for node_id in collection_ids
+    ]
+    if all(staged_ids) and len(set(staged_ids)) == len(staged_ids):
+        raise ValueError(
+            "native flow contains explicitly staged collection nodes; repair_native_rpa_flow only removes accidental duplicates"
+        )
     keep_id = collection_ids[0]
     remove_ids = collection_ids[1:]
     statements_argument["value"] = [node_id for node_id in statement_ids if node_id not in set(remove_ids)]
@@ -6524,6 +7809,41 @@ def reorder_native_rpa_steps(
     metadata_ok, metadata, _ = _safe_json(metadata_path)
     metadata = metadata if metadata_ok and isinstance(metadata, dict) else {}
     metadata["componentsNum"] = len(requested_ids)
+    # Keep the model-facing plan aligned with the authoritative native
+    # MAIN_COMPONENT order.  Reordering used to update only io5cd.task, which
+    # left stale plan dependencies and caused the next incremental append to
+    # point at deleted or out-of-order steps.
+    component_plan, _ = _rpa_component_plan(metadata)
+    if isinstance(component_plan, list):
+        by_id = {
+            str(item.get("id") or "").strip(): item
+            for item in component_plan
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        if set(by_id) == set(requested_ids) and len(by_id) == len(requested_ids):
+            revised_plan = [deepcopy(by_id[step_id]) for step_id in requested_ids]
+            _normalize_linear_plan_dependencies(revised_plan)
+            for order, item in enumerate(revised_plan, start=1):
+                item["order"] = order
+            metadata["mcpComponentPlan"] = revised_plan
+            execution_plan = metadata.get("mcpExecutionPlan")
+            if isinstance(execution_plan, dict):
+                revised_execution_plan = deepcopy(execution_plan)
+                revised_execution_plan["steps"] = deepcopy(revised_plan)
+                revised_execution_plan.pop("plan_id", None)
+                revised_execution_plan["plan_id"] = (
+                    "plan-"
+                    + hashlib.sha256(
+                        json.dumps(
+                            revised_execution_plan,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()[:16]
+                )
+                metadata["mcpExecutionPlan"] = revised_execution_plan
+                metadata["mcpPlanId"] = revised_execution_plan["plan_id"]
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     temporary = task_path.with_suffix(task_path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
@@ -6554,12 +7874,278 @@ def reorder_native_rpa_steps(
     }
 
 
+def _native_output_variables(node: dict[str, Any]) -> set[str]:
+    """Return the variable names one node writes into the flow scope."""
+    component = str(node.get("type") or "")
+    names = {str(item).strip() for item in _native_output_names(node, component) if str(item).strip()}
+    if component == "WebBrowser_DataCollectionV5":
+        for name in ("var0", "var1", "var2"):
+            value = str(_native_task_argument(node, name, "") or "").strip()
+            if value:
+                names.add(value)
+    return names
+
+
+def _native_removal_dependents(
+    payload: dict[str, Any],
+    step_id: str,
+    *,
+    replacement_variables: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Find later steps that read a variable produced by the removed node.
+
+    The native task is the authority: a producer is removable only when no
+    remaining statement consumes its output. This is intentionally a
+    conservative, structural check, not a full data-flow analysis.
+    """
+    entities = payload.get("componentModelEntities")
+    if not isinstance(entities, dict):
+        return []
+    target = entities.get(str(step_id))
+    if not isinstance(target, dict):
+        return []
+    produced = _native_output_variables(target) - set(replacement_variables or ())
+    if not produced:
+        return []
+    dependents: list[dict[str, Any]] = []
+    for node_id in _native_statement_ids(payload):
+        if node_id == str(step_id):
+            continue
+        node = entities.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        component = str(node.get("type") or "")
+        values = _native_argument_values(node, component)
+        for argument_name, value in values.items():
+            if not isinstance(value, str) or not value:
+                continue
+            if value.startswith('"') and value.endswith('"'):
+                continue
+            hit = next((name for name in produced if name in value), None)
+            if hit:
+                dependents.append(
+                    {"step_id": node_id, "component": component, "variable": hit, "parameter": argument_name}
+                )
+    return dependents
+
+
+def _drop_plan_steps(metadata: dict[str, Any], step_id: str) -> dict[str, Any]:
+    """Remove one step from the authoritative plan and its legacy mirror."""
+    updates: dict[str, Any] = {}
+    execution_plan = metadata.get("mcpExecutionPlan")
+    if isinstance(execution_plan, dict) and isinstance(execution_plan.get("steps"), list):
+        plan = deepcopy(execution_plan)
+        plan["steps"] = [
+            deepcopy(item)
+            for item in plan["steps"]
+            if not (isinstance(item, dict) and str(item.get("id") or "") == str(step_id))
+        ]
+        plan.pop("plan_id", None)
+        plan["plan_id"] = (
+            "plan-"
+            + hashlib.sha256(
+                json.dumps(plan, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:16]
+        )
+        updates.update(mcpExecutionPlan=plan, mcpPlanId=plan["plan_id"], mcpComponentPlan=deepcopy(plan["steps"]))
+        updates["mcpPlanSource"] = "mcpExecutionPlan.steps"
+    elif isinstance(metadata.get("mcpComponentPlan"), list):
+        steps = [
+            deepcopy(item)
+            for item in metadata["mcpComponentPlan"]
+            if not (isinstance(item, dict) and str(item.get("id") or "") == str(step_id))
+        ]
+        updates.update(mcpComponentPlan=steps, mcpPlanSource="mcpComponentPlan")
+    return updates
+
+
+def remove_rpa_step(
+    paths: ShizaiPaths,
+    flow_ref: str,
+    step_id: str,
+    *,
+    expected_revision: str | None = None,
+    client: Any | None = None,
+    allow_dependents: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Delete one main-flow step, guarded by revision and by its consumers.
+
+    A step whose output variable is still read by a later step is refused unless
+    ``allow_dependents`` is set, so a model cannot silently break a downstream
+    binding. The removal is a real task-graph mutation: it drops the statement
+    and its entity, updates the plan metadata, then re-materializes through the
+    same writeback path as every other native edit.
+    """
+    project_dir = resolve_project(paths, flow_ref)
+    revision = check_revision(project_dir, expected_revision)
+    task_path, payload = _native_task_file(project_dir)
+    entities = payload.get("componentModelEntities")
+    if not isinstance(entities, dict):
+        raise ValueError("native task has no componentModelEntities")
+    target_id = str(step_id).strip()
+    if not target_id:
+        raise ValueError("step_id is required")
+    order = _native_statement_ids(payload)
+    node = entities.get(target_id)
+    if not isinstance(node, dict) or target_id == "MAIN_COMPONENT":
+        raise WorkflowEditError(
+            "step_not_found",
+            "目标步骤不存在，请从 read_flow(detail=edit) 的 steps 中选择稳定 id。",
+            step_id=target_id,
+            retryable=False,
+            next_call={"tool": "shizai_rpa_read_flow", "arguments": {"flow_ref": str(project_dir), "detail": "edit"}},
+        )
+    if target_id not in order:
+        raise WorkflowEditError(
+            "unsupported_edit_target",
+            "当前删除仅支持主流程步骤；嵌套节点和主容器需专门的图编辑接口。",
+            step_id=target_id,
+            retryable=False,
+        )
+    if len(order) <= 1:
+        raise ValueError("cannot remove the last remaining step; a flow must keep at least one component")
+
+    component = str(node.get("type") or "")
+    element_ids = _native_element_ids_from_node(node)
+    dependents = _native_removal_dependents(payload, target_id)
+    if dependents and not allow_dependents:
+        raise WorkflowEditError(
+            "step_has_dependents",
+            "该步骤的输出变量仍被后续步骤引用；先改绑下游步骤，或显式传 allow_dependents=true 强制删除。",
+            step_id=target_id,
+            dependents=dependents,
+            retryable=False,
+            next_call={
+                "tool": "shizai_rpa_read_flow",
+                "arguments": {"flow_ref": str(project_dir), "detail": "edit", "step_id": dependents[0]["step_id"]},
+            },
+        )
+
+    plan_updates: dict[str, Any] = {}
+    metadata_ok, metadata, _ = _safe_json(project_dir / "szrpa.json")
+    metadata = metadata if metadata_ok and isinstance(metadata, dict) else {}
+    plan_updates = _drop_plan_steps(metadata, target_id)
+    # Removing the JS field-preparation node also removes its generated-field
+    # contract. Leaving mcpUseJsLink set would make the collection step fail
+    # validation for a capture that no longer exists, so clear the flags that
+    # only described the deleted node.
+    metadata_cleanup: list[str] = []
+    if component == "WebBrowser_RunJsInIeBySelector_v3" and not any(
+        str((entities.get(item) or {}).get("type") or "") == "WebBrowser_RunJsInIeBySelector_v3"
+        for item in order
+        if item != target_id
+    ):
+        for flag in (
+            "mcpUseJsLink",
+            "mcpUseJsTable",
+            "mcpJsOutputMode",
+            "mcpJsOutputVariable",
+            "mcpResultElementsReady",
+        ):
+            if flag in metadata:
+                metadata.pop(flag, None)
+                metadata_cleanup.append(flag)
+
+    removal = {
+        "step_id": target_id,
+        "component": component,
+        "label": str(node.get("label") or ""),
+        "element_ids": element_ids,
+        "dependents": dependents,
+        "remaining_step_ids": [item for item in order if item != target_id],
+    }
+    if dry_run:
+        return redact_payload(
+            {
+                "kind": "native_rpa_step_removal_preview",
+                "flow_ref": str(project_dir),
+                "flow_file": str(task_path),
+                "revision": revision,
+                "saved": False,
+                "dry_run": True,
+                "removal": removal,
+                "plan_updates": sorted(plan_updates),
+                "metadata_cleanup": metadata_cleanup,
+                "validation": validate_rpa_project(paths, str(project_dir), publish_ui=False),
+                "validation_basis": "current_flow_state",
+                "next_call": {
+                    "tool": "shizai_rpa_remove_step",
+                    "arguments": {
+                        "project_ref": str(project_dir),
+                        "step_id": target_id,
+                        "expected_revision": revision,
+                        "dry_run": False,
+                        "allow_write": True,
+                    },
+                },
+                "message": (
+                    "预览不会写入；validation 是删除前的当前磁盘状态，可能包含被删节点引起的既有错误。"
+                    "提交时携带 expected_revision 与 allow_write=true，删除后会重新校验并清掉只描述被删节点的元数据标记。"
+                ),
+            }
+        )
+
+    statements_argument = next(
+        (
+            item
+            for item in (entities["MAIN_COMPONENT"].get("args0") if isinstance(entities["MAIN_COMPONENT"].get("args0"), list) else [])
+            if isinstance(item, dict) and item.get("name") == "statements" and isinstance(item.get("value"), list)
+        ),
+        None,
+    )
+    if statements_argument is None:
+        raise ValueError("native task MAIN_COMPONENT has no statements list")
+    statements_argument["value"] = [item for item in order if item != target_id]
+    entities.pop(target_id, None)
+    # The plan metadata is authoritative for ordering contracts; drop the node
+    # from it before the writeback so validation sees one consistent graph.
+    if plan_updates or metadata_cleanup:
+        metadata.update(plan_updates)
+        (project_dir / "szrpa.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+        )
+    _update_native_metadata(project_dir, len(statements_argument["value"]))
+    temporary = task_path.with_suffix(task_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(task_path)
+    writeback = _finalize_native_writeback(paths, project_dir, task_path, client=client)
+    validation = validate_rpa_project(paths, str(project_dir), strict=False)
+    _publish_rpa_ui(
+        "step_removed",
+        "step_removal",
+        f"已删除步骤 {target_id} 并重新物化；请重新读取后再校验或运行。",
+        animation="step_order_complete",
+        overlay_state="inactive",
+        flow_ref=str(project_dir),
+        removed_step_id=target_id,
+    )
+    return redact_payload(
+        {
+            "kind": "native_rpa_step_removed",
+            "flow_ref": str(project_dir),
+            "flow_file": str(task_path),
+            "revision_before": revision,
+            "revision_after": flow_revision(project_dir),
+            "saved": True,
+            "removal": removal,
+            "plan_updates": sorted(plan_updates),
+            "metadata_cleanup": metadata_cleanup,
+            "writeback": writeback,
+            "validation": validation,
+            "valid": bool(validation.get("valid")),
+            "message": "已删除目标步骤并重新物化设计器运行文件；请重新读取流程并在运行前复核元素绑定。",
+        }
+    )
+
+
 def add_rpa_step(
     paths: ShizaiPaths,
     flow_ref: str,
     component: str,
     *,
     step_id: str | None = None,
+    before_step_id: str | None = None,
     label: str | None = None,
     element_ids: list[str] | None = None,
     config: dict[str, Any] | None = None,
@@ -6573,6 +8159,7 @@ def add_rpa_step(
             flow_ref,
             component,
             step_id=step_id,
+            before_step_id=before_step_id,
             label=label,
             element_ids=element_ids,
             config=config,
@@ -6587,6 +8174,7 @@ def _add_rpa_step_unlocked(
     component: str,
     *,
     step_id: str | None = None,
+    before_step_id: str | None = None,
     label: str | None = None,
     element_ids: list[str] | None = None,
     config: dict[str, Any] | None = None,
@@ -6606,6 +8194,7 @@ def _add_rpa_step_unlocked(
                 str(candidate.resolve()),
                 component,
                 step_id=step_id,
+                before_step_id=before_step_id,
                 label=label,
                 element_ids=element_ids,
                 config=config,
@@ -6627,6 +8216,7 @@ def _add_rpa_step_unlocked(
                 str(resolved),
                 component,
                 step_id=step_id,
+                before_step_id=before_step_id,
                 label=label,
                 element_ids=element_ids,
                 config=config,
@@ -6653,7 +8243,7 @@ def _add_rpa_step_unlocked(
         reasons = "; ".join(contract.get("materialization_errors") or ["unsupported catalog code contract"])
         raise ValueError(f"RPA component cannot be materialized: {component_name}: {reasons}")
     steps = flow["steps"]
-    _guard_rpa_append_structure(steps, component_name)
+    _guard_rpa_append_structure(steps, component_name, config)
     pending_binding = next(
         (item for item in steps if isinstance(item, dict) and str(item.get("binding_status") or "") == "unbound"),
         None,
@@ -6750,6 +8340,9 @@ def _add_rpa_step_unlocked(
         )
         if len(normalized_ids) != len(set(normalized_ids)):
             raise ValueError("WebBrowser_DataCollectionV5 has duplicate column element bindings")
+        collection_stage = _collection_stage_value({"config": step_config})
+        if collection_stage:
+            step_config["collection_stage"] = collection_stage
     if component_name == "WebBrowser_RunJsInIeBySelector_v3":
         js_table = bool(flow.get("use_js_table"))
         step_config.setdefault(
@@ -6799,9 +8392,63 @@ def _add_rpa_step_unlocked(
         if normalized_ids
         else ("unbound" if contract["requires_elements"] else "not_required"),
     }
+    if component_name == "WebBrowser_DataCollectionV5":
+        collection_stage = _collection_stage_value({"config": step_config})
+        if collection_stage:
+            step["collection_stage"] = collection_stage
     if component_name == "WebBrowser_RunJsInIeBySelector_v3" and normalized_ids and not bool(flow.get("use_js_table")):
         _upsert_js_generated_elements(paths, flow_ref, normalized_ids[0])
-    steps.append(step)
+    normalized_before_step_id = str(before_step_id or "").strip()
+    if normalized_before_step_id:
+        insert_index = next(
+            (
+                index
+                for index, item in enumerate(steps)
+                if isinstance(item, dict) and str(item.get("id") or "").strip() == normalized_before_step_id
+            ),
+            None,
+        )
+        if insert_index is None:
+            raise ValueError(f"before_step_id is not an existing step: {normalized_before_step_id}")
+        steps.insert(insert_index, step)
+        component_plan, plan_key = _rpa_component_plan(flow)
+        if isinstance(component_plan, list) and component_plan:
+            revised_plan = deepcopy(component_plan)
+            plan_index = next(
+                (
+                    index
+                    for index, item in enumerate(revised_plan)
+                    if isinstance(item, dict) and str(item.get("id") or "").strip() == normalized_before_step_id
+                ),
+                None,
+            )
+            if plan_index is not None:
+                target = revised_plan[plan_index]
+                dependencies = list(target.get("depends_on") or []) if isinstance(target, dict) else []
+                revised_plan.insert(
+                    plan_index,
+                    {
+                        "id": normalized_step_id,
+                        "component": component_name,
+                        "purpose": label or contract["designer_label"],
+                        "depends_on": dependencies,
+                        "config": deepcopy(step_config),
+                        "outputs": [str(step_config.get("output_variable") or "")]
+                        if component_name == "WebBrowser_RunJsInIeBySelector_v3"
+                        else [],
+                    },
+                )
+                if isinstance(target, dict):
+                    target["depends_on"] = [normalized_step_id]
+                for order, item in enumerate(revised_plan, start=1):
+                    if isinstance(item, dict):
+                        item["order"] = order
+                if plan_key == "execution_plan.steps":
+                    flow.setdefault("execution_plan", {})["steps"] = revised_plan
+                else:
+                    flow[plan_key] = revised_plan
+    else:
+        steps.append(step)
     flow["status"] = "browser_open_step_added" if component_name == "WebBrowser_CreateV3" else "components_added"
     flow["phase"] = "browser_capture_required" if component_name == "WebBrowser_CreateV3" else "component_added"
     if component_name in {"Keyboard_Send_V1", "Keyboard_PressNew"}:
@@ -6956,6 +8603,51 @@ def set_rpa_step_elements(
     }
 
 
+def _sync_plan_step_metadata(
+    metadata: dict[str, Any],
+    step_id: str,
+    config: dict[str, Any],
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Update the authoritative plan and its legacy mirror as one metadata write."""
+    execution_plan = metadata.get("mcpExecutionPlan")
+    if isinstance(execution_plan, dict) and isinstance(execution_plan.get("steps"), list):
+        plan = deepcopy(execution_plan)
+        steps = deepcopy(plan["steps"])
+        source = "mcpExecutionPlan.steps"
+    elif isinstance(metadata.get("mcpComponentPlan"), list):
+        plan = None
+        steps = deepcopy(metadata["mcpComponentPlan"])
+        source = "mcpComponentPlan"
+    else:
+        return {}
+    target = next(
+        (item for item in steps if isinstance(item, dict) and str(item.get("id") or "") == str(step_id)),
+        None,
+    )
+    if target is None:
+        return {}
+    merged_config = dict(target.get("config") or {})
+    merged_config.update(deepcopy(config))
+    target["config"] = merged_config
+    target["outputs"] = _logical_plan_outputs(str(target.get("component") or ""), contract, merged_config)
+    updates: dict[str, Any] = {
+        "mcpComponentPlan": deepcopy(steps),
+        "mcpPlanSource": source,
+    }
+    if plan is not None:
+        plan["steps"] = deepcopy(steps)
+        plan.pop("plan_id", None)
+        plan["plan_id"] = (
+            "plan-"
+            + hashlib.sha256(
+                json.dumps(plan, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:16]
+        )
+        updates.update(mcpExecutionPlan=plan, mcpPlanId=plan["plan_id"])
+    return updates
+
+
 def update_rpa_step_config(
     paths: ShizaiPaths,
     flow_ref: str,
@@ -7001,36 +8693,34 @@ def update_rpa_step_config(
         }
         break
     flow_state = _native_rpa_state(paths, str(project_dir))
+    metadata_ok, plan_metadata, _ = _safe_json(project_dir / "szrpa.json")
+    plan_metadata = plan_metadata if metadata_ok and isinstance(plan_metadata, dict) else {}
+    live_contract = _live_rpa_contract(paths, component) or {}
     # Normalize planner/CLI aliases before checking the live native arguments.
     # This keeps the public update surface in sync with component_catalog and
     # avoids a stale hand-maintained whitelist blocking valid settings.
     normalized_config = _adapt_rpa_component_config(component, dict(config), flow_state)
     if component == "WebBrowser_DataCollectionV5":
-        # The public CLI accepts an id returned by rpa-scan-page for either
-        # pagination control. DataCollectionV5 needs a page-context selector,
-        # not the button's full descendant chain, so materialize a stable
-        # generated page-scope element before writing either native argument.
+        # Add and edit paths share the same DataCollectionV5 formatter
+        # contract. Raw DeepCapture ids become a dedicated expression-safe
+        # mcp-page-scope selector in memory so dry-run stays read-only and the
+        # final revision check does not observe this update's own write.
         try:
-            pending_element_path, page_elements = _element_file(paths, str(project_dir))
+            element_path, current_elements = _element_file(paths, str(project_dir))
+            prepared_elements = deepcopy(current_elements)
         except (FileNotFoundError, OSError, ValueError):
-            page_elements = {"elementMap": {}}
-        element_map = page_elements.get("elementMap") if isinstance(page_elements, dict) else {}
-        for selector_name in ("selector_page", "selector_more"):
-            raw_selector = normalized_config.get(selector_name)
-            if raw_selector in (None, ""):
-                continue
-            selector_value = str(raw_selector).strip()
-            if selector_value == MCP_PAGE_SCOPE_ELEMENT_ID:
-                normalized_config[selector_name] = _native_page_selector_expression(selector_value)
-            elif not selector_value.startswith("elementsFormatNew(") and not selector_value.startswith(
-                "SHIZAI_ELEMENT_DICT["
-            ):
-                if isinstance(element_map, dict) and selector_value in element_map:
-                    page_scope_id = _upsert_page_scope_element(
-                        paths, str(project_dir), selector_value, pending_elements=page_elements
-                    )
-                    pending_elements = page_elements
-                    normalized_config[selector_name] = _native_page_selector_expression(page_scope_id)
+            element_path = None
+            current_elements = None
+            prepared_elements = None
+        normalized_config = _materialize_collection_paging_selectors(
+            paths,
+            str(project_dir),
+            normalized_config,
+            pending_elements=prepared_elements,
+        )
+        if prepared_elements is not None and prepared_elements != current_elements:
+            pending_elements = prepared_elements
+            pending_element_path = element_path
     if isinstance(normalized_config.get("pagination"), dict):
         normalized_config.pop("pagination", None)
     allowed: dict[str, set[str]] = {
@@ -7042,7 +8732,7 @@ def update_rpa_step_config(
         "Basic_Delay_V1": {"second"},
         "WebBrowser_RunJsInIeBySelector_v3": {
             "jsCode", "input", "waitResultTimeout", "uiSelector", "output_variable",
-            "page_scope", "result_mode", "output_columns", "max_rows",
+            "page_scope", "result_mode", "output_columns", "max_rows", "isAsyncCode",
         },
         "WebBrowser_DataCollectionV5": {
             "designated_obj", "toExcel", "output_file", "columns", "config", "max_rows",
@@ -7148,6 +8838,12 @@ def update_rpa_step_config(
                 )
             elif name == "waitResultTimeout":
                 _native_set_argument(node, name, str(value))
+            elif name == "isAsyncCode":
+                # RuntimeHost's RunJsInIeBySelector_v3 contract expects the
+                # native checkbox slot as a numeric literal (1/0).  Passing a
+                # JSON-encoded string ("1"/"0") makes the generated call use
+                # isAsyncCode="1", which fails boolean conversion at runtime.
+                _native_set_parameter(node, name, "1" if _native_bool(value) else "0")
             elif name == "output_variable":
                 _native_set_argument(node, "var_name", str(value).strip())
             elif name == "page_scope":
@@ -7159,6 +8855,7 @@ def update_rpa_step_config(
                 if name in native_parameter_names:
                     _native_set_parameter(node, name, _generic_native_value(value))
         elif component == "WebBrowser_DataCollectionV5":
+            output_parameters = set(live_contract.get("output_parameters") or [])
             if name == "designated_obj":
                 _native_set_argument(node, name, _native_designated_object(value))
             elif name == "toExcel":
@@ -7223,7 +8920,11 @@ def update_rpa_step_config(
                 elif name == "filePath":
                     _native_set_parameter(node, name, json.dumps(str(value), ensure_ascii=False))
                 else:
-                    _native_set_parameter(node, name, _generic_native_value(value))
+                    _native_set_parameter(
+                        node,
+                        name,
+                        _generic_native_value(value, output_parameter=name in output_parameters),
+                    )
         elif component == "Excel_Cs_NewV4":
             if name in {"path", "name", "software"}:
                 set_json(name, str(value))
@@ -7256,6 +8957,7 @@ def update_rpa_step_config(
         if name in native_parameter_names and name not in {
             "output_variable", "page_scope", "output_columns", "max_rows", "result_mode",
             "columns", "output_file", "pagination", "output_path", "data_attributes",
+            "designated_obj",
             "pageInfo", "page_info", "page_url", "page_title", "pageUrl", "windowTitle",
         }:
             after_value = next(
@@ -7357,9 +9059,6 @@ def update_rpa_step_config(
                 "mcpCollectionRegion": effective_paging["region"],
                 "mcpCollectionPageType": effective_paging["page_type"],
                 "mcpCollectionPageTypeNum": effective_paging["page_type_num"],
-                "mcpMaxRows": int(effective_paging["collect_items"])
-                if effective_paging["collect_items"].isdigit()
-                else effective_paging["collect_items"],
             }
         )
 
@@ -7396,6 +9095,9 @@ def update_rpa_step_config(
             configured = raw_path / (Path(raw_name).name or "result.xlsx")
         if configured:
             metadata_updates["mcpOutputPath"] = str(configured)
+    metadata_updates.update(
+        _sync_plan_step_metadata(plan_metadata, str(step_id), dict(config), live_contract)
+    )
     changes = parameter_changes(original_node, node)
     check_revision(project_dir, revision)
     if dry_run:
@@ -7414,6 +9116,14 @@ def update_rpa_step_config(
         "component_writing", "component_update", f"正在更新组件 {component} 的参数并重新校验。",
         animation="component_update", flow_ref=str(project_dir), component=component, step_id=str(step_id),
     )
+    if component == "Database_DBConnect":
+        _ensure_sqlite_database_file(
+            {
+                "dtype": _native_task_argument(node, "dtype", ""),
+                "DatabaseConfig": _native_task_argument(node, "DatabaseConfig", []),
+            },
+            project_dir=project_dir,
+        )
     # All parameter conversion succeeds before the first durable mutation.
     if pending_elements is not None and pending_element_path is not None:
         temporary = pending_element_path.with_suffix(pending_element_path.suffix + ".tmp")
@@ -7591,7 +9301,7 @@ def bind_rpa_pagination(
     # A metadata row target is part of the model's output contract. Preserve it
     # when an older task still contains its template default during a paging bind.
     state = _native_rpa_state(paths, str(project_dir))
-    if state.get("max_rows") not in (None, "", 0):
+    if selected_region == "3" and state.get("max_rows") not in (None, "", 0):
         updates["collect_items"] = state["max_rows"]
     result = update_rpa_step_config(paths, str(project_dir), str(step_id), updates, client=client)
     readback_state = _native_rpa_state(paths, str(project_dir))
@@ -7612,7 +9322,20 @@ def bind_rpa_pagination(
         else []
     )
     columns_unchanged = readback_column_ids == column_ids
-    if "mcp-page-scope" not in readback_selector or other_selector:
+    referenced_page_elements = set(_NATIVE_ELEMENT_RE.findall(readback_selector))
+    _, readback_elements = _element_file(paths, str(project_dir))
+    readback_element_map = readback_elements.get("elementMap") if isinstance(readback_elements, dict) else {}
+    readback_element_map = readback_element_map if isinstance(readback_element_map, dict) else {}
+    page_scope = readback_element_map.get(MCP_PAGE_SCOPE_ELEMENT_ID)
+    generated_scope_matches = (
+        MCP_PAGE_SCOPE_ELEMENT_ID in referenced_page_elements
+        and isinstance(page_scope, dict)
+        and str(page_scope.get("mcpPageScopeSource") or "").strip() == normalized_element_id
+    )
+    if (
+        normalized_element_id not in referenced_page_elements
+        and not generated_scope_matches
+    ) or other_selector:
         raise ValueError(
             "pagination_binding_readback_conflict: "
             + json.dumps(
@@ -7628,6 +9351,9 @@ def bind_rpa_pagination(
     binding = {
         "mode": normalized_mode,
         "element_id": normalized_element_id,
+        "selector_element_id": (
+            MCP_PAGE_SCOPE_ELEMENT_ID if generated_scope_matches else normalized_element_id
+        ),
         "source": source,
         "verification_status": verification,
         "selector_argument": selector_name,
@@ -7784,7 +9510,7 @@ def mark_rpa_result_capture_ready(
         {
             canonical
             for canonical in (_canonical_result_field(item) for item in raw_fields)
-            if canonical in {"product_name", "merchant", "price", "sales", "link"}
+            if canonical in _RPA_RESULT_FIELDS
         }
     )
     required = _result_capture_requirements(
@@ -7796,7 +9522,7 @@ def mark_rpa_result_capture_ready(
         _canonical_result_field(key): str(value).strip()
         for key, value in (field_element_ids or {}).items()
         if str(value or "").strip()
-        and _canonical_result_field(key) in {"product_name", "merchant", "price", "sales", "link"}
+        and _canonical_result_field(key) in _RPA_RESULT_FIELDS
     }
     unverified_field_ids = _unverified_element_ids(paths, loaded["flow_ref"], normalized_ids.values())
     ready = required.issubset(set(normalized_fields)) and not unverified_field_ids
@@ -7886,16 +9612,21 @@ def mark_rpa_result_capture_ready(
     }
 
 
-def validate_rpa_flow(paths: ShizaiPaths, flow_ref: str, *, strict: bool = False) -> dict[str, Any]:
+def validate_rpa_flow(
+    paths: ShizaiPaths, flow_ref: str, *, strict: bool = False, publish_ui: bool = True
+) -> dict[str, Any]:
     """Validate component order and element bindings for staged or native flows."""
-    _publish_rpa_ui(
-        "validating",
-        "flow_validation",
-        "正在校验流程顺序、元素绑定、输出列和变量交接。",
-        animation="flow_validation",
-        flow_ref=str(flow_ref),
-        strict=bool(strict),
-    )
+    # Read-only previews reuse this validator but must not drive the designer
+    # overlay; only committed writes publish progress.
+    if publish_ui:
+        _publish_rpa_ui(
+            "validating",
+            "flow_validation",
+            "正在校验流程顺序、元素绑定、输出列和变量交接。",
+            animation="flow_validation",
+            flow_ref=str(flow_ref),
+            strict=bool(strict),
+        )
     native_flow = False
     candidate = Path(flow_ref).expanduser()
     if candidate.is_dir() and not (candidate / RPA_FLOW_FILE).is_file():
@@ -7926,7 +9657,7 @@ def validate_rpa_flow(paths: ShizaiPaths, flow_ref: str, *, strict: bool = False
     errors: list[str] = []
     warnings: list[str] = []
     steps = flow["steps"]
-    component_plan = flow.get("component_plan") or flow.get("mcpComponentPlan")
+    component_plan, plan_source = _rpa_component_plan(flow)
     plan_backed = isinstance(component_plan, list) and bool(component_plan)
     model_owned = _rpa_model_decides(flow)
     request_analysis = flow.get("request_analysis") or flow.get("mcpRequestAnalysis") or {}
@@ -7937,7 +9668,18 @@ def validate_rpa_flow(paths: ShizaiPaths, flow_ref: str, *, strict: bool = False
         errors.append("the first component must be WebBrowser_CreateV3")
     actual_components = [str(step.get("component") or "") for step in steps if isinstance(step, dict)]
     collection_count = actual_components.count("WebBrowser_DataCollectionV5")
-    if collection_count > 1:
+    collection_steps = [
+        step
+        for step in steps
+        if isinstance(step, dict) and str(step.get("component") or "") == "WebBrowser_DataCollectionV5"
+    ]
+    collection_stages = [_collection_stage_value(step) for step in collection_steps]
+    explicitly_staged_collections = bool(
+        collection_count > 1
+        and all(collection_stages)
+        and len(set(collection_stages)) == len(collection_stages)
+    )
+    if collection_count > 1 and not explicitly_staged_collections:
         errors.append(
             "designer_state_conflict: flow contains multiple WebBrowser_DataCollectionV5 steps; keep one final collection step"
         )
@@ -8020,14 +9762,17 @@ def validate_rpa_flow(paths: ShizaiPaths, flow_ref: str, *, strict: bool = False
                 )
         if component == "WebBrowser_DataCollectionV5":
             seen_collection = True
-            columns = step.get("config", {}).get("columns") if isinstance(step.get("config"), dict) else None
+            step_config = step.get("config") if isinstance(step.get("config"), dict) else {}
+            columns = step_config.get("columns")
+            stage_columns = columns if plan_backed and _collection_stage_value(step) else flow.get("required_columns", [])
+            stage_columns = stage_columns if isinstance(stage_columns, list) else []
             if not isinstance(columns, list) or not columns:
                 errors.append("WebBrowser_DataCollectionV5 must declare output columns")
-            elif len(columns) < len(flow.get("required_columns", [])):
+            elif len(columns) < len(stage_columns):
                 warnings.append("data collection declares fewer columns than the requested output")
             elif any(
                 str(required) not in {str(column) for column in columns}
-                for required in flow.get("required_columns", [])
+                for required in stage_columns
             ):
                 errors.append("WebBrowser_DataCollectionV5 columns must include the requested output fields")
         if component == "WebBrowser_RunJsInIeBySelector_v3" and bool(flow.get("use_js_table")):
@@ -8089,23 +9834,28 @@ def validate_rpa_flow(paths: ShizaiPaths, flow_ref: str, *, strict: bool = False
             + "; recapture them with DeepCapture before running"
         )
     valid = not errors and (not strict or not warnings)
-    ui_feedback = _publish_rpa_ui(
-        "flow_ready" if valid else "validation_failed",
-        "flow_validation",
-        "整条流程校验通过，可以继续物化和运行。" if valid else "整条流程校验未通过，请根据 errors 修复后重试。",
-        animation="flow_complete" if valid else "validation_error",
-        flow_ref=str(flow_path.parent),
-        step_count=len(steps),
-        valid=valid,
-        next_tool=(
-            "shizai_rpa_validate_project"
-            if valid and native_flow
-            else ("shizai_rpa_validate_flow" if not valid else None)
-        ),
+    ui_feedback = (
+        _publish_rpa_ui(
+            "flow_ready" if valid else "validation_failed",
+            "flow_validation",
+            "整条流程校验通过，可以继续物化和运行。" if valid else "整条流程校验未通过，请根据 errors 修复后重试。",
+            animation="flow_complete" if valid else "validation_error",
+            flow_ref=str(flow_path.parent),
+            step_count=len(steps),
+            valid=valid,
+            next_tool=(
+                "shizai_rpa_validate_project"
+                if valid and native_flow
+                else ("shizai_rpa_validate_flow" if not valid else None)
+            ),
+        )
+        if publish_ui
+        else None
     )
     return {
         "flow_ref": str(flow_path.parent),
         "flow_file": str(flow_path),
+        "plan_source": plan_source,
         "valid": valid,
         "strict": strict,
         "errors": errors,
@@ -8262,7 +10012,7 @@ def validate_rpa_step(
         check("predecessor_exists", bool(steps[index - 1]), "the preceding component is present")
 
     config = step.get("config") if isinstance(step.get("config"), dict) else {}
-    component_plan = flow.get("component_plan") or flow.get("mcpComponentPlan")
+    component_plan, plan_source = _rpa_component_plan(flow)
     planned_step = (
         component_plan[index]
         if isinstance(component_plan, list) and index < len(component_plan) and isinstance(component_plan[index], dict)
@@ -8280,9 +10030,11 @@ def validate_rpa_step(
         )
     )
     native_node: dict[str, Any] | None = None
+    native_payload: dict[str, Any] | None = None
     if flow.get("kind") == "native-shizai-rpa":
         try:
             task_path, payload = _native_task_file(Path(loaded["flow_ref"]))
+            native_payload = payload if isinstance(payload, dict) else None
             entities = payload.get("componentModelEntities")
             candidate = entities.get(normalized_id) if isinstance(entities, dict) else None
             native_node = candidate if isinstance(candidate, dict) else None
@@ -8291,6 +10043,7 @@ def validate_rpa_step(
             check("native_node", False, f"native task cannot be read: {exc}")
 
     native_args = _task_argument_map(native_node) if native_node else {}
+    accepted_web_page_names = _accepted_web_page_object_names(native_payload, index, planned_step)
 
     def argument(name: str, default: Any = "") -> Any:
         if native_node is not None:
@@ -8414,7 +10167,13 @@ def validate_rpa_step(
         output_variables = [str(item).strip() for item in planned_step.get("outputs", []) if str(item).strip()]
     if component == "WebBrowser_RunJsInIeBySelector_v3":
         if plan_backed:
-            output_variables = [str(item).strip() for item in planned_step.get("outputs", []) if str(item).strip()]
+            planned_mode, _ = _normalize_js_result_mode(planned_config.get("result_mode"))
+            if planned_mode == "table":
+                output_variables = [
+                    str(planned_config.get("output_variable") or JS_TABLE_OUTPUT_VARIABLE).strip()
+                ]
+            else:
+                output_variables = [str(item).strip() for item in planned_step.get("outputs", []) if str(item).strip()]
         elif bool(flow.get("use_js_table")):
             output_variables = [JS_TABLE_OUTPUT_VARIABLE]
     output_argument_names = {
@@ -8426,10 +10185,13 @@ def validate_rpa_step(
         "Excel_Cs_NewV4": ("var_name",),
     }.get(component, tuple(contract.get("output_parameters") or []))
     actual_outputs = [str(argument(name)).strip() for name in output_argument_names if present(argument(name))]
+    output_detail = f"expected outputs {output_variables}; found {actual_outputs}"
+    if output_variables and len(actual_outputs) > len(output_variables):
+        output_detail += f"; surplus native slots: {', '.join(actual_outputs[len(output_variables):])}"
     check(
         "output_variables",
-        actual_outputs == output_variables,
-        f"expected outputs {output_variables}; found {actual_outputs}",
+        _output_variables_match(component, output_variables, actual_outputs),
+        output_detail,
     ) if output_variables else check("output_variables", not actual_outputs, "component has no output variables")
 
     if component == "WebBrowser_CreateV3":
@@ -8453,8 +10215,9 @@ def validate_rpa_step(
         )
         check(
             "js_web_page_binding",
-            _decode_selector_value(argument("web_page")) == "网页对象",
-            f"{extraction_label} uses the WebBrowser_CreateV3 output 网页对象",
+            _decode_selector_value(argument("web_page")) in accepted_web_page_names,
+            f"{extraction_label} uses the upstream browser object; accepted names: "
+            + ", ".join(accepted_web_page_names),
         )
         check(
             "js_execution_environment",
@@ -8517,8 +10280,9 @@ def validate_rpa_step(
     elif component == "WebBrowser_DataCollectionV5":
         check(
             "collection_web_page_binding",
-            _decode_selector_value(argument("designated_obj")) == "网页对象",
-            "DataCollectionV5 uses the WebBrowser_CreateV3 output 网页对象",
+            _decode_selector_value(argument("designated_obj")) in accepted_web_page_names,
+            "DataCollectionV5 uses the upstream browser object; accepted names: "
+            + ", ".join(accepted_web_page_names),
         )
         paging = _collection_paging_settings(
             {
@@ -8580,6 +10344,7 @@ def validate_rpa_step(
                     f"count-limited collection page_type_num must be 0, 1, or 2; found {page_type_num}",
                 )
         columns = config.get("columns") if isinstance(config.get("columns"), list) else []
+        collection: dict[str, Any] = {}
         column_configs: list[dict[str, Any]] = []
         if native_node:
             try:
@@ -8590,6 +10355,10 @@ def validate_rpa_step(
             except (TypeError, json.JSONDecodeError):
                 columns = []
         required_columns = [str(item) for item in flow.get("required_columns", DEFAULT_RPA_COLUMNS)]
+        if plan_backed and component == "WebBrowser_DataCollectionV5" and _collection_stage_value(step):
+            stage_columns = config.get("columns") if isinstance(config.get("columns"), list) else []
+            if stage_columns:
+                required_columns = [str(item) for item in stage_columns if str(item).strip()]
         check("output_columns", bool(columns), "data collection output columns are declared")
         check(
             "column_binding",
@@ -8625,13 +10394,29 @@ def validate_rpa_step(
                     False,
                     str(issue.get("message") or "invalid collection binding"),
                 )
+            for issue in _collection_runtime_capability_diagnostics(collection, columns):
+                check(
+                    str(issue.get("check") or "collection_runtime_capability"),
+                    False,
+                    str(issue.get("message") or "unsupported collection configuration"),
+                )
         to_excel = _decode_selector_value(argument("toExcel", config.get("toExcel", 1)))
         check(
             "excel_handoff_mode",
             not flow.get("excel_mode") or to_excel == "0",
             "explicit Excel mode requires DataCollectionV5.toExcel=0",
         )
-        if flow.get("use_js_link"):
+        generated_fields_bound = any(
+            element_id in {
+                JS_NAME_ELEMENT_ID,
+                JS_MERCHANT_ELEMENT_ID,
+                JS_PRICE_ELEMENT_ID,
+                JS_SALES_ELEMENT_ID,
+                JS_LINK_ELEMENT_ID,
+            }
+            for element_id in element_ids
+        )
+        if flow.get("use_js_link") and generated_fields_bound:
             has_js_step = any(
                 isinstance(item, dict) and item.get("component") == "WebBrowser_RunJsInIeBySelector_v3"
                 for item in steps
@@ -8641,21 +10426,6 @@ def validate_rpa_step(
                 has_js_step,
                 "use_js_link flow contains WebBrowser_RunJsInIeBySelector_v3 before collection",
             )
-            check(
-                "generated_link_binding",
-                JS_LINK_ELEMENT_ID in element_ids,
-                f"collection binds generated element {JS_LINK_ELEMENT_ID}",
-            )
-            merchant_requested = any(
-                _canonical_result_field(item) == "merchant"
-                for item in columns
-            )
-            if merchant_requested:
-                check(
-                    "generated_merchant_binding",
-                    JS_MERCHANT_ELEMENT_ID in element_ids,
-                    f"collection binds generated element {JS_MERCHANT_ELEMENT_ID}",
-                )
     elif component == "Excel_Cs_NewV4":
         check(
             "excel_output_name",
@@ -8716,6 +10486,7 @@ def validate_rpa_step(
         "kind": "rpa_step_validation",
         "flow_ref": loaded["flow_ref"],
         "flow_file": loaded["flow_file"],
+        "plan_source": plan_source,
         "step_id": normalized_id,
         "step_index": index,
         "component": component,
@@ -8737,6 +10508,583 @@ def validate_rpa_step(
             {"valid": valid, "step_id": normalized_id, "component": component},
         ),
         "next_action": next_action,
+    }
+
+
+def preview_rpa_collection(
+    paths: ShizaiPaths,
+    flow_ref: str,
+    step_id: str,
+    *,
+    client: Any | None = None,
+    sample_limit: int = 4,
+) -> dict[str, Any]:
+    """Run DataCollectionV5's native preview against the current browser page."""
+    project_dir = resolve_project(paths, flow_ref)
+    task_path, payload = _native_task_file(project_dir)
+    entities = payload.get("componentModelEntities")
+    node = entities.get(str(step_id)) if isinstance(entities, dict) else None
+    if not isinstance(node, dict):
+        raise ValueError(f"RPA step not found: {step_id}")
+    if node.get("type") != "WebBrowser_DataCollectionV5":
+        raise ValueError(f"RPA step is not WebBrowser_DataCollectionV5: {step_id}")
+
+    config = _native_collection_config(node)
+    page_info = config.get("pageInfo") if isinstance(config.get("pageInfo"), dict) else {}
+    collection = config.get("collectionConfig") if isinstance(config.get("collectionConfig"), dict) else {}
+    preview_collection = deepcopy(collection)
+    for key, default in (
+        ("tableSelector", []),
+        ("columnSelectorArray", []),
+        ("columnConfigArray", []),
+        ("mergeConfigMap", {}),
+        ("commonSelector", []),
+        ("scrollVerticalDelay", -1),
+        ("scrollMaxTotalDelay", 0),
+        ("selectorVersion", "1.4"),
+        ("scrollType", 0),
+    ):
+        preview_collection.setdefault(key, deepcopy(default))
+    preview_params = {
+        "dataCollectConfig": {
+            "turningPageConfig": {},
+            "pageInfo": deepcopy(page_info),
+            "collectionConfig": preview_collection,
+        },
+        "colorGuidanceConfig": {
+            "actionCmd": "preview",
+            "highlight": 0,
+            "rows": [],
+            "columns": [],
+        },
+        "dataFilePath": tempfile.gettempdir(),
+        "collectDataCount": 0,
+        "turnPageCount": "1",
+        "webData": "",
+    }
+
+    caller = client or ShizaiDesktopAgent()
+    response = caller.call(
+        "DataCollectService",
+        "dataCollectCapturePreview",
+        [{"jsonParams": json.dumps(preview_params, ensure_ascii=False, separators=(",", ":"))}],
+    )
+    rows = response.get("data") if isinstance(response, dict) and "data" in response else response
+    rows = rows if isinstance(rows, list) else []
+    normalized_rows = [list(row) if isinstance(row, (list, tuple)) else [row] for row in rows]
+    headers = normalized_rows[0] if normalized_rows else [
+        str(item.get("columnHeader") or "")
+        for item in preview_collection["columnConfigArray"]
+        if isinstance(item, dict)
+    ]
+    data_rows = [row for row in normalized_rows[1:] if any(value not in (None, "") for value in row)]
+    limit = min(20, max(0, int(sample_limit)))
+    comparable_rows = [
+        [str(value).strip() for value in row[: len(headers)]]
+        for row in data_rows
+        if len(row) >= 2
+    ]
+    collapsed_rows = [
+        row
+        for row in comparable_rows
+        if len(row) >= 2 and len(set(row)) == 1
+    ]
+    column_collapse = bool(comparable_rows) and len(headers) >= 2 and len(collapsed_rows) == len(comparable_rows)
+    valid = bool(data_rows) and not column_collapse
+    failure_kind = "column_collapse" if column_collapse else None if valid else "empty_preview"
+    return {
+        "kind": "native_collection_preview",
+        "flow_ref": str(project_dir),
+        "flow_file": str(task_path),
+        "step_id": str(step_id),
+        "component": "WebBrowser_DataCollectionV5",
+        "performed": True,
+        "valid": valid,
+        "header_count": len(headers),
+        "headers": headers,
+        "data_row_count": len(data_rows),
+        "sample_rows": data_rows[:limit],
+        "failure_kind": failure_kind,
+        "message": (
+            f"原生数据采集预览返回 {len(data_rows)} 行有效数据。"
+            if valid
+            else (
+                "原生数据采集预览的多列在每个样例行中完全相同，说明列 selector 已坍缩到同一批元素；禁止运行采集步骤。"
+                if column_collapse
+                else "原生数据采集预览只有表头或为空；禁止运行未修改的采集步骤。"
+            )
+        ),
+        "next_action": (
+            None
+            if valid
+            else {
+                "tool": "shizai_rpa_read_flow",
+                "arguments": {"flow_ref": str(project_dir), "detail": "edit", "step_id": str(step_id)},
+                "reason": "读取当前采集配置并修复同一流程；需要真实网页 selector，不能继续使用 UIA 推导的 DOM 路径。",
+            }
+        ),
+    }
+
+
+def _renderer_data(value: Any) -> Any:
+    if isinstance(value, dict) and "isSuccess" in value and "data" in value:
+        if value.get("isSuccess") is False:
+            raise ShizaiCloudError(str(value.get("message") or "designer renderer call failed"))
+        return value.get("data")
+    return value
+
+
+def _project_editor_id(project_dir: Path) -> str:
+    edit_state_path = project_dir / "edit-state.json"
+    ok, edit_state, _ = _safe_json(edit_state_path)
+    editor_id = str(edit_state.get("currentEditorId") or "").strip() if ok and isinstance(edit_state, dict) else ""
+    if not editor_id:
+        raise ValueError(f"designer edit-state has no currentEditorId: {edit_state_path}")
+    return editor_id
+
+
+def _active_editor_id(client: ShizaiDesktopAgent, *, response_timeout: float = 15.0) -> str:
+    value = _renderer_data(
+        call_active_editor_renderer(
+            client,
+            "ArrangementEditService",
+            "getCurrentArrangementInfo",
+            [],
+            response_timeout=response_timeout,
+        )
+    )
+    return str(value.get("currentEditorId") or "").strip() if isinstance(value, dict) else ""
+
+
+def _editor_has_unsaved_changes(client: ShizaiDesktopAgent, *, response_timeout: float = 15.0) -> bool:
+    value = _renderer_data(
+        call_active_editor_renderer(
+            client,
+            "WorkbenchService",
+            "isNeedSave",
+            [],
+            response_timeout=response_timeout,
+        )
+    )
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        return bool(value.get("needSave") or value.get("isNeedSave"))
+    return False
+
+
+def _require_target_editor(client: ShizaiDesktopAgent, expected_editor_id: str) -> str:
+    active_editor_id = _active_editor_id(client)
+    if active_editor_id != expected_editor_id:
+        raise ValueError(
+            "active designer editor does not match the requested flow: "
+            f"expected {expected_editor_id!r}, found {active_editor_id or 'none'!r}"
+        )
+    return active_editor_id
+
+
+# A run must not wait on a designer RPC that may never answer: the guard is a
+# safety check on the fast path, and a desktop that cannot answer fails the run
+# itself with its own actionable error.
+_EDITOR_GUARD_TIMEOUT = 3.0
+
+
+def _editor_state_for_flow(project_dir: Path, client: Any | None) -> dict[str, Any]:
+    """Best-effort evidence about the designer editor that owns this flow.
+
+    The designer holds one editor at a time, so only the flow named by that
+    editor can carry unsaved canvas state. A different active editor, an
+    unreachable desktop, or a flow that was never opened never blocks.
+
+    Every desktop failure here means "no evidence", never "unsafe": the guard
+    must not turn a diagnostic problem into a blocked run.
+    """
+    state: dict[str, Any] = {"editor_present": False, "editor_dirty": False, "verified": False}
+    try:
+        editor_id = _project_editor_id(project_dir)
+    except ValueError:
+        return state
+    state["editor_id"] = editor_id
+    caller = client or ShizaiDesktopAgent()
+    try:
+        active_editor_id = _active_editor_id(caller, response_timeout=_EDITOR_GUARD_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 - evidence only, never a verdict
+        state["check_error"] = str(exc)
+        return state
+    if active_editor_id != editor_id:
+        state["active_editor_id"] = active_editor_id
+        return state
+    state["editor_present"] = True
+    try:
+        state["editor_dirty"] = _editor_has_unsaved_changes(caller, response_timeout=_EDITOR_GUARD_TIMEOUT)
+        state["verified"] = True
+    except Exception as exc:  # noqa: BLE001 - evidence only, never a verdict
+        state["check_error"] = str(exc)
+        state["editor_dirty"] = None
+    return state
+
+
+def _unsaved_editor_block(project_dir: Path, client: Any | None) -> dict[str, Any] | None:
+    """Block a run while the designer holds unsaved edits for this flow.
+
+    The designer owns canvas state. A run started while that state is unsaved
+    validates a flow the user cannot see on disk, which is how a run can look
+    successful while the persisted task is stale. Only a confirmed dirty flag
+    blocks; an unverified flag is reported instead of guessed.
+    """
+    state = _editor_state_for_flow(project_dir, client)
+    if not state.get("editor_present") or state.get("editor_dirty") is not True:
+        return None
+    return {
+        "kind": "native_rpa_editor_unsaved",
+        "status": "blocked",
+        "failure_kind": "editor_unsaved_changes",
+        "requires_save": True,
+        "retryable": True,
+        "flow_ref": str(project_dir),
+        "editor_id": state.get("editor_id"),
+        "editor_present": True,
+        "editor_dirty": True,
+        "editor_state_verified": bool(state.get("verified")),
+        "message": (
+            "designer 画布上有未保存改动，此时运行会验证磁盘上看不到的配置。"
+            "先保存，再重新运行。"
+        ),
+        "next_action": {
+            "tool": "shizai_rpa_save_editor",
+            "arguments": {
+                "project_ref": str(project_dir),
+                "expected_revision": flow_revision(project_dir),
+                "dry_run": False,
+                "allow_write": True,
+            },
+            "reason": "保存后 designer 的未保存状态清零，运行才对应真实落盘配置。",
+        },
+    }
+
+
+def reload_rpa_editor(
+    paths: ShizaiPaths,
+    flow_ref: str,
+    *,
+    expected_revision: str,
+    client: ShizaiDesktopAgent | None = None,
+    ready_timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Reload the active designer editor after an MCP write and wait for readiness."""
+    project_dir = resolve_project(paths, flow_ref)
+    revision_before = check_revision(project_dir, expected_revision)
+    editor_id = _project_editor_id(project_dir)
+    caller = client or ShizaiDesktopAgent()
+    _require_target_editor(caller, editor_id)
+    if _editor_has_unsaved_changes(caller):
+        raise ValueError("active designer editor has unsaved changes; save them before MCP reload")
+
+    reload_result = call_active_editor_renderer(caller, "WorkbenchService", "reload", [])
+    _renderer_data(reload_result)
+    deadline = time.monotonic() + max(1.0, min(float(ready_timeout), 30.0))
+    last_error = ""
+    ready_checks = 0
+    # The renderer acknowledges reload before the replacement editor has
+    # registered. Require two consecutive checks so callers do not run against
+    # the stale editor instance that produced the acknowledgement.
+    time.sleep(0.25)
+    while time.monotonic() < deadline:
+        try:
+            remaining = max(0.25, deadline - time.monotonic())
+            probe_timeout = max(0.25, min(1.5, remaining / 2))
+            if (
+                _active_editor_id(caller, response_timeout=probe_timeout) == editor_id
+                and not _editor_has_unsaved_changes(caller, response_timeout=probe_timeout)
+            ):
+                ready_checks += 1
+                if ready_checks >= 2:
+                    break
+            else:
+                ready_checks = 0
+        except (OSError, TimeoutError, ShizaiCloudError, ValueError) as exc:
+            last_error = str(exc)
+            ready_checks = 0
+        time.sleep(0.25)
+    editor_ready = ready_checks >= 2
+    if not editor_ready:
+        raise ShizaiCloudError(
+            "designer reload was acknowledged but the target editor did not become ready"
+            + (f": {last_error}" if last_error else "")
+        )
+    revision_after = flow_revision(project_dir)
+    return {
+        "kind": "native_rpa_editor_reloaded",
+        "flow_ref": str(project_dir),
+        "editor_id": editor_id,
+        "revision_before": revision_before,
+        "revision_after": revision_after,
+        "persisted_revision_unchanged": revision_after == revision_before,
+        "reload_acknowledged": True,
+        "editor_ready": True,
+        "ready_checks": ready_checks,
+        "canvas_configuration_verified": False,
+        "next_action": {
+            "tool": "shizai_rpa_run_component",
+            "arguments": {
+                "project_ref": str(project_dir),
+                "expected_revision": revision_after,
+                "allow_write": True,
+            },
+            "missing_arguments": ["step_id"],
+            "reason": "精确运行目标组件并核对生成代码/变量缓存，才能证明画布加载了新配置。",
+        },
+    }
+
+
+def _top_level_step_ids(context: dict[str, Any]) -> list[str]:
+    steps = context.get("steps") if isinstance(context, dict) else None
+    if not isinstance(steps, list):
+        return []
+    return [
+        str(step.get("id"))
+        for step in steps
+        if isinstance(step, dict) and step.get("id") and step.get("top_level")
+    ]
+
+
+def save_rpa_editor(
+    paths: ShizaiPaths,
+    flow_ref: str,
+    *,
+    expected_revision: str | None = None,
+    dry_run: bool = False,
+    client: ShizaiDesktopAgent | None = None,
+) -> dict[str, Any]:
+    """Save designer canvas edits, then verify the persisted state on disk.
+
+    The designer owns unsaved canvas state. An MCP write or a native run that
+    starts while that state is unsaved validates a flow the user cannot see on
+    disk, so this calls the designer's own save service and reports success only
+    when the dirty flag clears and the task file is re-read afterwards.
+    """
+    project_dir = resolve_project(paths, flow_ref)
+    revision_before = check_revision(project_dir, expected_revision)
+    editor_id = _project_editor_id(project_dir)
+    caller = client or ShizaiDesktopAgent()
+    _require_target_editor(caller, editor_id)
+    dirty_before = _editor_has_unsaved_changes(caller)
+    context_before = read_edit_context(paths, str(project_dir))
+    if dry_run:
+        return redact_payload(
+            {
+                "kind": "native_rpa_editor_save_preview",
+                "flow_ref": str(project_dir),
+                "editor_id": editor_id,
+                "revision": revision_before,
+                "dirty_before": dirty_before,
+                "steps": _top_level_step_ids(context_before),
+                "dry_run": True,
+                "saved": False,
+                "next_call": {
+                    "tool": "shizai_rpa_save_editor",
+                    "arguments": {
+                        "project_ref": str(project_dir),
+                        "expected_revision": revision_before,
+                        "dry_run": False,
+                        "allow_write": True,
+                    },
+                },
+                "message": "预览只读取 designer 的未保存状态，不写入；提交时携带 expected_revision 与 allow_write=true。",
+            }
+        )
+    _renderer_data(
+        call_active_editor_renderer(
+            caller, "PackageSaveService", "saveAll", [{"alertOnError": True}]
+        )
+    )
+    dirty_after = _editor_has_unsaved_changes(caller)
+    revision_after = flow_revision(project_dir)
+    context_after = read_edit_context(paths, str(project_dir))
+    result: dict[str, Any] = {
+        "kind": "native_rpa_editor_saved",
+        "flow_ref": str(project_dir),
+        "flow_file": str(context_after.get("flow_file") or ""),
+        "editor_id": editor_id,
+        "save_requested": True,
+        "saved": not dirty_after,
+        "dirty_before": dirty_before,
+        "dirty_after": dirty_after,
+        "revision_before": revision_before,
+        "revision_after": revision_after,
+        "persisted_change": revision_after != revision_before,
+        "steps_before": _top_level_step_ids(context_before),
+        "steps": _top_level_step_ids(context_after),
+        "truth_source": "native_task",
+    }
+    if dirty_after:
+        result["failure_kind"] = "save_unconfirmed"
+        result["retryable"] = True
+        result["message"] = (
+            "designer 接受了保存请求但仍报告未保存；请在前台处理保存对话框或错误提示后重试，不要继续运行。"
+        )
+        result["next_action"] = {
+            "tool": "shizai_rpa_save_editor",
+            "arguments": {
+                "project_ref": str(project_dir),
+                "expected_revision": revision_after,
+                "allow_write": True,
+            },
+            "reason": "未保存状态下的运行会验证磁盘上看不到的画布配置。",
+        }
+        return redact_payload(result)
+    if dirty_before and not result["persisted_change"]:
+        result["note"] = (
+            "保存前存在未保存状态，但 revision 未变化：改动可能写在未纳入 revision 的布局文件里，"
+            "也可能实际没有改动。继续前用 read_flow 确认目标参数已落盘。"
+        )
+    result["next_action"] = {
+        "tool": "shizai_rpa_reload_editor",
+        "arguments": {
+            "project_ref": str(project_dir),
+            "expected_revision": revision_after,
+            "allow_write": True,
+        },
+        "reason": "保存后刷新 editor，再用 run_component 按 revision 运行目标组件验证画布。",
+    }
+    return redact_payload(result)
+
+
+def _component_cache_summary(project_dir: Path, task_id: str, step_id: str) -> dict[str, Any] | None:
+    cache_path = project_dir / ".sz" / "variable_cache" / f"{task_id}.json"
+    ok, payload, _ = _safe_json(cache_path)
+    entry = payload.get(step_id) if ok and isinstance(payload, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    result = entry.get("result")
+    table = result[0] if isinstance(result, list) and result and isinstance(result[0], list) else None
+    summary: dict[str, Any] = {
+        "cache_path": str(cache_path),
+        "component_id": str(entry.get("componentId") or step_id),
+        "var_names": list(entry.get("varNames") or []),
+    }
+    if isinstance(table, list) and table and isinstance(table[0], list):
+        summary.update(
+            {
+                "headers": list(table[0]),
+                "data_row_count": max(0, len(table) - 1),
+                "sample_rows": [list(row) for row in table[1:4] if isinstance(row, list)],
+            }
+        )
+    else:
+        summary["result_present"] = result is not None
+    return summary
+
+
+def _runtime_artifact_snapshot(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"exists": False, "mtime_ns": None, "size": 0, "sha256": None}
+    content = path.read_bytes()
+    return {
+        "exists": True,
+        "mtime_ns": path.stat().st_mtime_ns,
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _runtime_artifact_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    if not after.get("exists"):
+        return False
+    return not before.get("exists") or any(
+        before.get(key) != after.get(key) for key in ("mtime_ns", "size", "sha256")
+    )
+
+
+def run_rpa_component(
+    paths: ShizaiPaths,
+    flow_ref: str,
+    step_id: str,
+    *,
+    expected_revision: str,
+    client: ShizaiDesktopAgent | None = None,
+) -> dict[str, Any]:
+    """Run exactly one component in the active designer and return compact evidence."""
+    project_dir = resolve_project(paths, flow_ref)
+    revision = check_revision(project_dir, expected_revision)
+    task_path, payload = _native_task_file(project_dir)
+    entities = payload.get("componentModelEntities")
+    node = entities.get(str(step_id)) if isinstance(entities, dict) else None
+    if not isinstance(node, dict):
+        raise ValueError(f"RPA step not found: {step_id}")
+    editor_id = _project_editor_id(project_dir)
+    caller = client or ShizaiDesktopAgent()
+    _require_target_editor(caller, editor_id)
+    if _editor_has_unsaved_changes(caller):
+        raise ValueError("active designer editor has unsaved changes; save or reload it before component execution")
+    package = _native_package_summary(paths, project_dir)
+    application_id = str(package.get("application_id") or "").strip()
+    if not package.get("matched") or not application_id:
+        raise ValueError("flow is not registered in the designer application_package index")
+
+    task_id = task_path.stem
+    code_path = project_dir / "projects" / "_temp" / "component_run.py"
+    cache_path = project_dir / ".sz" / "variable_cache" / f"{task_id}.json"
+    code_before = _runtime_artifact_snapshot(code_path)
+    cache_before = _runtime_artifact_snapshot(cache_path)
+    request = {
+        "projectId": application_id,
+        "editorId": editor_id,
+        "componentIds": [str(step_id)],
+        "isIPA": False,
+        "isUseTrigger": False,
+        # The designer's generated-code cache also restores non-serializable
+        # upstream values such as a live browser object for isolated steps.
+        "useCache": True,
+        "createCodeParams": {"useCache": True},
+    }
+    started = time.monotonic()
+    raw_run_result = call_active_editor_renderer(caller, "RunService", "runComponentInEditor", [request])
+    run_result = _renderer_data(raw_run_result)
+    elapsed_seconds = round(time.monotonic() - started, 3)
+    state = str(run_result.get("state") or "") if isinstance(run_result, dict) else ""
+    code_after = _runtime_artifact_snapshot(code_path)
+    cache_after = _runtime_artifact_snapshot(cache_path)
+    code_fresh = _runtime_artifact_changed(code_before, code_after)
+    cache_fresh = _runtime_artifact_changed(cache_before, cache_after)
+    code = code_path.read_text(encoding="utf-8") if code_path.is_file() else ""
+    generated_component_ids = list(dict.fromkeys(re.findall(r"#@![^\r\n]*?@!-@!([^@]+)@!-@!", code)))
+    cache_summary = _component_cache_summary(project_dir, task_id, str(step_id))
+    target_generated = str(step_id) in generated_component_ids
+    exact_component = target_generated and set(generated_component_ids) == {str(step_id)}
+    runtime_success = state.casefold() == "success"
+    collection_verified = (
+        node.get("type") == "WebBrowser_DataCollectionV5"
+        and cache_fresh
+        and isinstance(cache_summary, dict)
+        and int(cache_summary.get("data_row_count") or 0) > 0
+    )
+    runtime_verified = runtime_success and code_fresh and exact_component and (
+        collection_verified or node.get("type") != "WebBrowser_DataCollectionV5"
+    )
+    return {
+        "kind": "native_rpa_component_run",
+        "flow_ref": str(project_dir),
+        "flow_file": str(task_path),
+        "revision": revision,
+        "step_id": str(step_id),
+        "component": str(node.get("type") or ""),
+        "editor_id": editor_id,
+        "run_result": run_result,
+        "elapsed_seconds": elapsed_seconds,
+        "generated_code_path": str(code_path),
+        "generated_component_ids": generated_component_ids,
+        "generated_code_fresh": code_fresh,
+        "exact_component_verified": exact_component,
+        "cache": cache_summary,
+        "cache_fresh": cache_fresh,
+        "runtime_verified": runtime_verified,
+        "page_evidence_required": bool(node.get("mcpElementIds")) and not collection_verified,
+        "message": (
+            "目标组件已单独运行，并由生成代码和变量缓存验证。"
+            if runtime_verified
+            else "组件运行请求已返回，但本次生成代码或输出证据不足，不能视为单组件验证完成。"
+        ),
     }
 
 
@@ -8805,7 +11153,20 @@ def _staged_step(flow: dict[str, Any] | None, component: str) -> dict[str, Any] 
 
 def _native_task_file(project_dir: Path) -> tuple[Path, dict[str, Any]]:
     """Return the designer task file and its JSON payload for one application."""
-    candidates = sorted(project_dir.rglob("*.task"), key=lambda item: (item.name != "io5cd.task", str(item).lower()))
+    candidates = sorted(
+        (
+            item
+            for item in project_dir.rglob("*.task")
+            if "draft-restore-backup" not in {
+                part.casefold() for part in item.relative_to(project_dir).parts[:-1]
+            }
+        ),
+        key=lambda item: (
+            len(item.relative_to(project_dir).parts),
+            item.name != "io5cd.task",
+            str(item).lower(),
+        ),
+    )
     for task_path in candidates:
         ok, payload, _ = _safe_json(task_path)
         if not ok or not isinstance(payload, dict):
@@ -9939,16 +12300,33 @@ def _native_runtime_plugin_blocker(paths: ShizaiPaths, baseline: dict[str, int])
         except OSError:
             continue
         lines = content.splitlines()
+        # RuntimeHost logs the complete JavaScript source in a ``scriptCode``
+        # field.  Our scripts intentionally contain the interaction markers
+        # as error strings, so a source dump must never be treated as a real
+        # login/challenge signal.  Only standalone/runtime result lines may
+        # trigger the user-interaction branch below.
+        interaction_lines = [
+            line
+            for line in lines
+            if '"scriptCode"' not in line and "'scriptCode'" not in line
+        ]
         interaction_reason = next(
             (
                 reason
                 for reason in ("login_required", "page_challenge")
-                if any(f"SHIZAI_WAITING_FOR_USER:{reason}" in line for line in reversed(lines))
+                if any(
+                    f"SHIZAI_WAITING_FOR_USER:{reason}" in line
+                    for line in reversed(interaction_lines)
+                )
             ),
             None,
         )
         if interaction_reason:
-            evidence = next(line for line in reversed(lines) if f"SHIZAI_WAITING_FOR_USER:{interaction_reason}" in line)
+            evidence = next(
+                line
+                for line in reversed(interaction_lines)
+                if f"SHIZAI_WAITING_FOR_USER:{interaction_reason}" in line
+            )
             user_prompt = (
                 "当前网页需要登录。请在现有浏览器窗口完成登录，确认后重新运行流程。"
                 if interaction_reason == "login_required"
@@ -10469,6 +12847,25 @@ def _native_cleanup_runtime(
     }
 
 
+def _requested_output_row_count(flow: dict[str, Any]) -> int:
+    """Return only a row target that came from the user's analyzed request."""
+    analysis = flow.get("request_analysis")
+    evidence = analysis.get("evidence") if isinstance(analysis, dict) else None
+    collection = evidence.get("collection") if isinstance(evidence, dict) else None
+    if isinstance(collection, dict) and "max_rows" in collection:
+        raw_value = collection.get("max_rows")
+        if raw_value in (None, ""):
+            return 0
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return max(0, int(flow.get("max_rows") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def native_rpa_status(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
     """Return local status and evidence for the last native RPA run."""
     project_dir = resolve_project(paths, project_ref)
@@ -10515,7 +12912,7 @@ def native_rpa_status(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
     empty_required_columns = list(output_quality.get("empty_required_columns") or [])
     complete_required_row_count = output_quality.get("complete_required_row_count")
     invalid_link_rows = int(output_quality.get("invalid_link_rows") or 0)
-    expected_data_row_count = int(flow.get("max_rows") or 0)
+    expected_data_row_count = _requested_output_row_count(flow)
     runtime_terminal = str(runtime_evidence.get("terminal_status") or "").casefold()
     fresh_output = bool(expected_output and expected_output.get("fresh_for_run"))
     if status == "failed" and (
@@ -10793,6 +13190,31 @@ def _publish_native_run_blocked(paths: ShizaiPaths, project_dir: Path, detail: s
     )
 
 
+def _publish_native_editor_block(paths: ShizaiPaths, project_dir: Path, detail: str) -> None:
+    """Persist an unsaved-designer block so the next status call stays truthful."""
+    _write_native_run_state(
+        paths,
+        project_dir,
+        {
+            "project": str(project_dir),
+            "status": "blocked",
+            "failure_kind": "editor_unsaved_changes",
+            "error": detail,
+            "blocked_at": time.time(),
+        },
+    )
+    _publish_rpa_ui(
+        "runtime_blocked",
+        "design_validation",
+        f"运行已暂停：designer 有未保存改动，暂未操作电脑。{detail}",
+        animation="native_rpa_blocked",
+        overlay_state="inactive",
+        flow_ref=str(project_dir),
+        status="blocked",
+        failure_kind="editor_unsaved_changes",
+    )
+
+
 def native_rpa_run(
     paths: ShizaiPaths,
     project_ref: str,
@@ -10812,6 +13234,43 @@ def native_rpa_run(
     for callers that only need submission acknowledgement.
     """
     project_dir = resolve_project(paths, project_ref)
+    editor_block = _unsaved_editor_block(project_dir, client)
+    if editor_block is not None:
+        _publish_native_editor_block(paths, project_dir, str(editor_block["message"]))
+        return editor_block
+    if input_param is not None and not isinstance(input_param, dict):
+        raise ValueError("input_param must be a JSON object")
+    # Older MCP-created flows may already contain a complete plan but predate
+    # the browser lifecycle finalizer. Repair them immediately before the
+    # first runtime diagnosis so this run cannot create another orphan tab.
+    browser_cleanup = ensure_native_browser_cleanup_step(
+        paths,
+        str(project_dir),
+        client=client,
+    )
+    if browser_cleanup.get("error_code") == "editor_unsaved_changes":
+        return browser_cleanup
+    # Ensure a concrete SQLite target survives a clean checkout or a deleted
+    # previous output before RuntimeHost reaches Database_DBConnect.
+    try:
+        _, payload_for_db = _native_task_file(project_dir)
+    except FileNotFoundError:
+        # Let the normal sync diagnosis report the actionable application_package
+        # or missing-task error.  Database preparation must never mask that
+        # preflight result for a malformed/incomplete native project.
+        payload_for_db = {}
+    entities_for_db = payload_for_db.get("componentModelEntities")
+    if isinstance(entities_for_db, dict):
+        for node_for_db in entities_for_db.values():
+            if not isinstance(node_for_db, dict) or node_for_db.get("type") != "Database_DBConnect":
+                continue
+            _ensure_sqlite_database_file(
+                {
+                    "dtype": _native_task_argument(node_for_db, "dtype", ""),
+                    "DatabaseConfig": _native_task_argument(node_for_db, "DatabaseConfig", []),
+                },
+                project_dir=project_dir,
+            )
     try:
         task_path, _ = _normalize_native_page_scope_js(project_dir)
         _ensure_native_runtime_support(paths, project_dir, task_path, client=client)
@@ -10832,10 +13291,12 @@ def native_rpa_run(
     debug_capabilities = debug_core.debug_capabilities(paths, str(project_dir))
     design_validation_cleanup: dict[str, Any] = {
         "active_before_run": bool(debug_capabilities.get("active_session")),
+        "cleanup_required_before_run": bool(debug_capabilities.get("cleanup_required")),
+        "session_status_before_run": debug_capabilities.get("session_status"),
         "deep_capture_touched": False,
         "stopped": False,
     }
-    if debug_capabilities.get("active_session"):
+    if debug_capabilities.get("active_session") or debug_capabilities.get("cleanup_required"):
         stopped_debug = debug_core.debug_stop(paths, str(project_dir), client=client)
         cleanup_errors = stopped_debug.get("errors") or []
         cleanup_complete = bool(stopped_debug.get("cleanup_complete", not cleanup_errors))
@@ -10849,8 +13310,6 @@ def native_rpa_run(
         if not cleanup_complete:
             detail = "; ".join(str(item) for item in cleanup_errors) or "native debug cleanup failed"
             raise ValueError(f"unable to stop the active design-validation session before production run: {detail}")
-    if input_param is not None and not isinstance(input_param, dict):
-        raise ValueError("input_param must be a JSON object")
     task_path = Path(str(diagnosis["task"]["path"]))
     task_path, _ = _normalize_native_page_scope_js(project_dir)
     _ensure_native_runtime_support(paths, project_dir, task_path, client=client)
@@ -10890,6 +13349,7 @@ def native_rpa_run(
         "workflow_run_id": request["workflow_run_id"],
         "request": redact_payload(request),
         "design_validation_cleanup": design_validation_cleanup,
+        "browser_cleanup": browser_cleanup,
     }
     # Excel_Cs_NewV4 rejects an existing workbook.  Resolve names from the
     # materialized native flow, including the explicit Excel component's
@@ -11079,6 +13539,7 @@ def native_rpa_run(
         ),
         "runtime_mask_force_close": (native_rpc_result.get("runtime_mask_force_close") if native_rpc_result else None),
         "design_validation_cleanup": design_validation_cleanup,
+        "browser_cleanup": browser_cleanup,
         "runtime_cleanup": runtime_cleanup,
         "project": str(project_dir),
         "application_id": application_id,
@@ -11281,6 +13742,11 @@ _NATIVE_CODE_DESCRIPTORS: dict[str, tuple[str, tuple[str, ...], str]] = {
         ),
         "WebBrowser",
     ),
+    "WebBrowser_CloseWeb_V2": (
+        "CloseWeb_V2",
+        ("colse_type", "browser_type", "web", "kill", "is_close_alert"),
+        "WebBrowser",
+    ),
     "Excel_Cs_NewV4": ("Cs_NewV4", ("path", "name", "software", "show", "maximize", "share"), "Excel"),
     "Excel_Cs_WriteRange": ("Cs_WriteRange", ("workbook", "sheet", "row", "column", "contents", "save"), "Excel"),
 }
@@ -11330,6 +13796,17 @@ _NATIVE_OPTION_NAMES: dict[str, tuple[str, ...]] = {
     "Basic_Delay_V1": (),
     "WebBrowser_RunJsInIeBySelector_v3": ("var_ret", "delay_before_new", "delay_after_new", "skip_err", "log_exc"),
     "WebBrowser_DataCollectionV5": ("var_ret",),
+    "WebBrowser_CloseWeb_V2": (
+        "var_ret",
+        "delay_before_new",
+        "delay_after_new",
+        "timeout_new",
+        "exc_retry",
+        "retry_count",
+        "retry_interval",
+        "skip_err",
+        "log_exc",
+    ),
     "Excel_Cs_NewV4": (
         "var_ret",
         "delay_before_new",
@@ -11465,6 +13942,23 @@ _NATIVE_DEFAULT_VALUES: dict[str, dict[str, Any]] = {
         "share": "0",
         "var_ret": "0",
     },
+    "WebBrowser_CloseWeb_V2": {
+        "var_name": "操作结果",
+        "colse_type": '"select"',
+        "browser_type": '"chrome"',
+        "web": "网页对象",
+        "kill": "0",
+        "is_close_alert": "0",
+        "var_ret": "0",
+        "delay_before_new": "0.2",
+        "delay_after_new": "0.2",
+        "timeout_new": "10",
+        "exc_retry": "0",
+        "retry_count": "1",
+        "retry_interval": "1",
+        "skip_err": "0",
+        "log_exc": "1",
+    },
     "Excel_Cs_NewV4": {
         "software": '"默认"',
         "show": "1",
@@ -11524,9 +14018,14 @@ def _native_parse_object_value(value: str) -> Any:
 
 
 def _native_normalize_click_data(value: Any) -> Any:
-    """Normalize Element.SetValue click data to the RuntimeHost schema."""
+    """Normalize element click-position data to the RuntimeHost schema."""
     if isinstance(value, str):
         parsed = _native_parse_object_value(value)
+        if parsed is value:
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                pass
         if parsed is not value:
             value = parsed
     if not isinstance(value, dict):
@@ -11549,6 +14048,9 @@ def _native_normalize_click_data(value: Any) -> Any:
             normalized[key] = integer(normalized[key])
     offset = normalized.get("offset")
     if isinstance(offset, dict):
+        # clickPositionV2 may persist its UI-only random flag inside offset,
+        # but RuntimeHost accepts random only at the click_data root.
+        offset.pop("random", None)
         for key in ("x", "y"):
             if key in offset:
                 offset[key] = integer(offset[key])
@@ -11728,7 +14230,7 @@ def _native_argument_values(node: dict[str, Any], component: str) -> dict[str, A
         for entry in entries if isinstance(entries, list) else []:
             if isinstance(entry, dict) and entry.get("name"):
                 values[str(entry["name"])] = entry.get("value")
-    if component == "Element_SetValue_V6" and "click_data" in values:
+    if component in {"Element_SetValue_V6", "Element_Click_V6"} and "click_data" in values:
         values["click_data"] = _native_normalize_click_data(values["click_data"])
     if component == "WebBrowser_RunJsInIeBySelector_v3":
         values["input"] = _native_list_expression(
@@ -11747,6 +14249,7 @@ def _native_output_names(node: dict[str, Any], component: str) -> list[str]:
     if component in {
         "WebBrowser_CreateV3",
         "WebBrowser_GetTAB_V1",
+        "WebBrowser_CloseWeb_V2",
         "WebBrowser_RunJsInIeBySelector_v3",
         "Excel_Cs_NewV4",
     }:
@@ -12772,8 +15275,9 @@ def _ensure_native_runtime_support(
             "mcpUseJsTable",
         )
     )
+    component_plan, plan_source = _rpa_component_plan(metadata)
     plan_backed = bool(
-        metadata.get("mcpComponentPlan")
+        component_plan
         and (
             metadata.get("mcpPlanComplete")
             or metadata.get("mcpPlanId")
@@ -12803,7 +15307,7 @@ def _ensure_native_runtime_support(
             raw_contract = execution_plan.get("output_contract")
             if isinstance(raw_contract, dict):
                 plan_output_contract = raw_contract
-        for planned in metadata.get("mcpComponentPlan", []):
+        for planned in component_plan:
             if (
                 isinstance(planned, dict)
                 and planned.get("component") == "WebBrowser_DataCollectionV5"
@@ -12856,11 +15360,54 @@ def _ensure_native_runtime_support(
         for node in entities.values():
             if not isinstance(node, dict) or node.get("type") != "WebBrowser_DataCollectionV5":
                 continue
+            node_plan_collection_config = plan_collection_config
+            if plan_backed:
+                planned_for_node = next(
+                    (
+                        item
+                        for item in component_plan
+                        if isinstance(item, dict)
+                        and str(item.get("id") or "").strip() == str(node.get("id") or "").strip()
+                        and item.get("component") == "WebBrowser_DataCollectionV5"
+                        and isinstance(item.get("config"), dict)
+                    ),
+                    None,
+                )
+                if isinstance(planned_for_node, dict):
+                    node_plan_collection_config = dict(planned_for_node["config"])
             # A model-backed plan owns its component parameters. Apply its
             # concrete values when repairing an older task, while leaving
             # deferred selectors empty until live page evidence is captured.
             if mcp_managed:
-                collection_source = plan_collection_config if plan_backed else metadata
+                collection_source = dict(node_plan_collection_config if plan_backed else metadata)
+                if not plan_backed:
+                    task_paging = {
+                        name: _native_task_argument(node, name, "")
+                        for name in (
+                            "region",
+                            "collect_pages",
+                            "collect_items",
+                            "page_type",
+                            "page_type_num",
+                            "selector_page",
+                            "selector_more",
+                        )
+                    }
+                    metadata_aliases = {
+                        "region": "mcpCollectionRegion",
+                        "collect_items": "mcpMaxRows",
+                        "page_type": "mcpCollectionPageType",
+                        "page_type_num": "mcpCollectionPageTypeNum",
+                    }
+                    for name, value in task_paging.items():
+                        alias = metadata_aliases.get(name)
+                        if name not in collection_source and (not alias or alias not in collection_source):
+                            collection_source[name] = value
+                collection_source = _materialize_collection_paging_selectors(
+                    paths,
+                    str(root),
+                    collection_source,
+                )
                 collection_paging = _collection_paging_settings(collection_source)
                 # Some native designer versions do not persist the optional
                 # paging selector in szrpa.json. Keep the selector already
@@ -12891,7 +15438,7 @@ def _ensure_native_runtime_support(
                         task_changed = True
                 if plan_backed:
                     output_file = _collection_output_file(
-                        plan_collection_config,
+                        node_plan_collection_config,
                         fallback=metadata.get("mcpOutputFile") or "result.xlsx",
                     )
                     output_path = Path(output_file)
@@ -12911,7 +15458,7 @@ def _ensure_native_runtime_support(
                     file_path = (
                         str(configured.parent)
                         if configured is not None
-                        else str(plan_collection_config.get("filePath") or "res")
+                        else str(node_plan_collection_config.get("filePath") or "res")
                     )
                     encoded_path = json.dumps(file_path, ensure_ascii=False)
                     if _native_task_argument(node, "filePath") != encoded_path:
@@ -12921,18 +15468,18 @@ def _ensure_native_runtime_support(
                             _native_set_argument(node, "filePath", encoded_path)
                         task_changed = True
                     metadata_updates = {
-                        "mcpRequiredColumns": plan_collection_config.get(
+                        "mcpRequiredColumns": node_plan_collection_config.get(
                             "columns", metadata.get("mcpRequiredColumns", [])
                         ),
                         "mcpOutputFile": output_path.name or "result.xlsx",
                         "mcpOutputPath": str(configured) if configured else None,
-                        "mcpMaxRows": _normalize_max_rows(
-                            plan_output_contract.get("max_rows")
-                            or plan_collection_config.get("collect_items"),
-                            default=metadata.get("mcpMaxRows", 0),
-                        ),
                     }
-                    current_paging = _collection_paging_settings(plan_collection_config)
+                    if plan_output_contract.get("max_rows") not in (None, ""):
+                        metadata_updates["mcpMaxRows"] = _normalize_max_rows(
+                            plan_output_contract["max_rows"],
+                            default=metadata.get("mcpMaxRows", 0),
+                        )
+                    current_paging = _collection_paging_settings(node_plan_collection_config)
                     metadata_updates.update(
                         {
                             "mcpCollectionRegion": current_paging.get("region", "1"),
@@ -12941,20 +15488,6 @@ def _ensure_native_runtime_support(
                         }
                     )
                     _update_native_metadata(root, len(_native_statement_ids(task_payload)), metadata_updates)
-            for argument in node.get("args0", []):
-                if not isinstance(argument, dict) or argument.get("name") != "selector_page":
-                    continue
-                value = argument.get("value")
-                if not isinstance(value, str):
-                    continue
-                stripped = value.strip()
-                if (
-                    stripped
-                    and not stripped.startswith("elementsFormatNew(")
-                    and stripped.startswith("SHIZAI_ELEMENT_DICT[")
-                ):
-                    argument["value"] = f"elementsFormatNew({stripped})"
-                    task_changed = True
         for node in entities.values():
             if not isinstance(node, dict) or node.get("type") != "WebBrowser_RunJsInIeBySelector_v3":
                 continue
@@ -13099,6 +15632,9 @@ def materialize_native_rpa(
     It also backfills editor compatibility metadata for legacy MCP packages.
     """
     project_dir = resolve_project(paths, project_ref)
+    metadata_ok, metadata, _ = _safe_json(project_dir / "szrpa.json")
+    metadata = metadata if metadata_ok and isinstance(metadata, dict) else {}
+    _, plan_source = _rpa_component_plan(metadata)
     _publish_rpa_ui(
         "materializing",
         "runtime_materialize",
@@ -13169,6 +15705,7 @@ def materialize_native_rpa(
     return {
         "kind": "native_rpa_materialized",
         "project": str(project_dir),
+        "plan_source": plan_source,
         "task": {
             "path": str(task_path),
             "node_id": task_path.stem,
@@ -13207,6 +15744,34 @@ def _native_statement_ids(payload: dict[str, Any]) -> list[str]:
             if isinstance(value, list):
                 return [str(item) for item in value]
     return []
+
+
+def _accepted_web_page_object_names(
+    payload: dict[str, Any] | None,
+    step_index: int,
+    planned_step: dict[str, Any],
+) -> list[str]:
+    """Names that may bind a page component to its upstream browser object.
+
+    The designer stores the browser node's own output variable in the consumer's
+    ``web_page`` / ``designated_obj`` slot, so a plan that renames the browser
+    object must not be rejected against the canonical default alone.
+    """
+    accepted: list[str] = []
+    statements = _native_statement_ids(payload) if isinstance(payload, dict) else []
+    if 0 < step_index <= len(statements):
+        entities = payload.get("componentModelEntities") if isinstance(payload, dict) else None
+        predecessor = entities.get(statements[step_index - 1]) if isinstance(entities, dict) else None
+        if isinstance(predecessor, dict) and str(predecessor.get("type") or "") in RPA_BROWSER_OBJECT_COMPONENTS:
+            name = _decode_selector_value(_native_task_argument(predecessor, "var_name", ""))
+            if name:
+                accepted.append(name)
+    for item in planned_step.get("outputs") or []:
+        name = str(item).strip()
+        if name:
+            accepted.append(name)
+    accepted.append(RPA_DEFAULT_WEB_PAGE_OBJECT)
+    return list(dict.fromkeys(accepted))
 
 
 def _native_component_entities(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -13394,6 +15959,19 @@ def _collection_output_file(config: dict[str, Any] | None, fallback: Any = "resu
     return fallback_text
 
 
+def _collection_to_excel_setting(
+    config: dict[str, Any] | None,
+    *,
+    excel_mode: bool,
+    fallback: Any = 1,
+) -> int:
+    """Resolve direct file output without changing it during an element rebind."""
+    if excel_mode:
+        return 0
+    source = config if isinstance(config, dict) else {}
+    return int(_native_bool(source.get("toExcel", fallback), default=_native_bool(fallback, default=True)))
+
+
 def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
     """Build the same agent-facing flow state from the real native task."""
     project_dir = resolve_project(paths, project_ref)
@@ -13409,9 +15987,8 @@ def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
     steps: list[dict[str, Any]] = []
     metadata_ok, metadata, _ = _safe_json(project_dir / "szrpa.json")
     metadata = metadata if metadata_ok and isinstance(metadata, dict) else {}
-    component_plan = metadata.get("mcpComponentPlan")
-    if not isinstance(component_plan, list):
-        component_plan = []
+    mcp_managed = any(str(key).startswith("mcp") for key in metadata)
+    component_plan, plan_source = _rpa_component_plan(metadata)
     plan_complete = bool(
         metadata.get("mcpPlanComplete")
         or metadata.get("mcpPlanId")
@@ -13475,8 +16052,9 @@ def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
         if component == "WebBrowser_RunJsInIeBySelector_v3":
             js_output = _decode_selector_value(_native_task_argument(node, "var_name", "商品链接"))
             if plan_backed:
-                use_js_table = str(metadata.get("mcpJsOutputMode") or "") == "table"
-                use_js_link = False
+                js_mode = str(metadata.get("mcpJsOutputMode") or "")
+                use_js_table = js_mode == "table"
+                use_js_link = bool(metadata.get("mcpUseJsLink", False))
             elif use_js_table or js_output == JS_TABLE_OUTPUT_VARIABLE:
                 use_js_table = True
                 use_js_link = False
@@ -13491,6 +16069,8 @@ def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
         if component == "WebBrowser_CreateV3":
             open_new_tab = _native_bool(_native_task_argument(node, "openNewTab", 0))
             step_config = {
+                "var_name": _decode_selector_value(_native_task_argument(node, "var_name", "网页对象"))
+                or "网页对象",
                 "url": target_url,
                 "type": "chrome",
                 "openNewTab": open_new_tab,
@@ -13590,6 +16170,12 @@ def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
                 "columns": [
                     item.get("columnHeader") for item in columns if isinstance(item, dict) and item.get("columnHeader")
                 ],
+                "var0": _decode_selector_value(_native_task_argument(node, "var0", "数据采集结果"))
+                or "数据采集结果",
+                "var1": _decode_selector_value(_native_task_argument(node, "var1", "Excel路径"))
+                or "Excel路径",
+                "var2": _decode_selector_value(_native_task_argument(node, "var2", "监控空列数据"))
+                or "监控空列数据",
                 "designated_obj": _decode_selector_value(_native_task_argument(node, "designated_obj", "网页对象"))
                 or "网页对象",
                 "toExcel": int(to_excel) if to_excel in {"0", "1"} else to_excel,
@@ -13601,6 +16187,26 @@ def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
                 "filePath": _decode_selector_value(_native_task_argument(node, "filePath", "res")) or "res",
                 **paging,
                 "pagination_capability": _collection_pagination_capability(paging),
+            }
+            collection_stage = str(node.get("mcpCollectionStage") or "").strip()
+            if not collection_stage and isinstance(planned_step, dict):
+                collection_stage = _collection_stage_value(planned_step)
+            if collection_stage:
+                step_config["collection_stage"] = collection_stage
+        elif component in {"WebBrowser_CloseWeb_V2", "WebBrowser_CloseWeb", "WebBrowser_CloseWeb_V1"}:
+            step_config = {
+                "var_name": _decode_selector_value(_native_task_argument(node, "var_name", "操作结果"))
+                or "操作结果",
+                "colse_type": _decode_selector_value(_native_task_argument(node, "colse_type", '"select"'))
+                or "select",
+                "browser_type": _decode_selector_value(_native_task_argument(node, "browser_type", '"chrome"'))
+                or "chrome",
+                "web": _native_task_argument(node, "web", "网页对象"),
+                "kill": _decode_selector_value(_native_task_argument(node, "kill", "0")) or "0",
+                "is_close_alert": _decode_selector_value(
+                    _native_task_argument(node, "is_close_alert", "0")
+                )
+                or "0",
             }
         elif component == "Excel_Cs_NewV4":
             step_config = {
@@ -13639,8 +16245,7 @@ def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
             native_config = _native_component_config(node)
             native_config.update(step_config)
             step_config = native_config
-        steps.append(
-            {
+        step_record = {
                 "id": str(node.get("id") or node_id),
                 "component": component,
                 "label": str(node.get("label") or ""),
@@ -13649,8 +16254,12 @@ def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
                 "binding_status": "bound"
                 if element_ids
                 else ("unbound" if bool(contract and contract.get("requires_elements")) else "not_required"),
-            }
-        )
+        }
+        if component == "WebBrowser_DataCollectionV5":
+            collection_stage = _collection_stage_value(step_record)
+            if collection_stage:
+                step_record["collection_stage"] = collection_stage
+        steps.append(step_record)
     model_partial = _rpa_model_decides({"planning_policy": metadata.get("mcpPlanningPolicy")}) and not plan_complete
     ready_for_validation = bool(steps) and not model_partial and len(steps) >= len(
         _rpa_sequence(
@@ -13684,10 +16293,15 @@ def _native_rpa_state(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
         "refresh_browser_tab": refresh_browser_tab,
         "result_elements_ready": result_elements_ready,
         "component_plan": component_plan,
+        "plan_source": plan_source,
         "plan_complete": plan_complete,
         "request_analysis": request_analysis,
         "plan_id": metadata.get("mcpPlanId"),
-        "planning_policy": metadata.get("mcpPlanningPolicy") or "",
+        # A designer-created project has no MCP ordering contract. Once an MCP
+        # client edits it, component order remains owned by that client instead
+        # of falling back to the legacy browser recipe.
+        "planning_policy": metadata.get("mcpPlanningPolicy") or ("model_decides" if not mcp_managed else ""),
+        "mcp_managed": mcp_managed,
         "open_new_tab": open_new_tab,
         "submit_component": submit_component or _rpa_submit_component({"steps": steps}),
         "steps": steps,
@@ -14045,8 +16659,19 @@ def attach_rpa_execution_plan(
             "mcpRequestAnalysis": analysis,
             "mcpExecutionPlan": plan,
             "mcpComponentPlan": component_plan,
+            "mcpPlanSource": "mcpExecutionPlan.steps",
             "mcpPlanComplete": True,
             "mcpPlanId": plan.get("plan_id"),
+            "mcpBrowserCleanupStepIds": [
+                str(item.get("id") or "").strip()
+                for item in component_plan
+                if isinstance(item, dict)
+                and item.get("browser_cleanup_for")
+                and str(item.get("component") or "") in {
+                    "WebBrowser_CloseWeb_V2", "WebBrowser_CloseWeb", "WebBrowser_CloseWeb_V1"
+                }
+                and str(item.get("id") or "").strip()
+            ],
             "mcpOriginalQuery": analysis.get("query"),
             "mcpRequestFingerprint": request_fingerprint,
             "mcpRequiredColumns": columns,
@@ -14122,6 +16747,7 @@ def _add_native_rpa_step(
     component: str,
     *,
     step_id: str | None = None,
+    before_step_id: str | None = None,
     label: str | None = None,
     element_ids: list[str] | None = None,
     config: dict[str, Any] | None = None,
@@ -14137,7 +16763,16 @@ def _add_native_rpa_step(
         raise ValueError("designer_state_conflict: " + (detail or "native task and designer artifacts disagree"))
     state = _native_rpa_state(paths, str(project_dir))
     component_name = str(component).strip()
-    _guard_rpa_append_structure(state["steps"], component_name)
+    # Incremental business steps belong before a managed closing tail. A
+    # user-authored close step keeps its explicit position.
+    if not before_step_id and component_name != "WebBrowser_CloseWeb_V2":
+        _, metadata, _ = _safe_json(project_dir / "szrpa.json")
+        cleanup_ids = set((metadata or {}).get("mcpBrowserCleanupStepIds") or [])
+        for trailing in reversed(state["steps"]):
+            if trailing["id"] not in cleanup_ids:
+                break
+            before_step_id = trailing["id"]
+    _guard_rpa_append_structure(state["steps"], component_name, config)
     step_index = len(state["steps"]) + 1
     _publish_rpa_ui(
         "component_writing",
@@ -14206,12 +16841,31 @@ def _add_native_rpa_step(
         # diagnostics after Chrome reorders UIA indexes.
         node["mcpElementIds"] = list(normalized_ids)
     effective_config = dict(config) if isinstance(config, dict) else {}
+    workflow_reference = str(effective_config.pop("workflow_reference", "") or "").strip()
+    if workflow_reference:
+        if component_name != "WebBrowser_RunJsInIeBySelector_v3":
+            raise ValueError("workflow_reference is only supported for the referenced component")
+        if workflow_reference != JD_PRODUCT_LINK_REFERENCE:
+            raise ValueError(f"unknown workflow_reference: {workflow_reference}")
+        effective_config.setdefault("jsCode", DEFAULT_JS_LINK_SCRIPT)
+        effective_config.setdefault("output_variable", "商品链接")
+        effective_config.setdefault("result_mode", "generated_markers")
+        effective_config.setdefault("page_scope", True)
     native_keyword = str(state.get("keyword") or "")
     native_output_file = str(state.get("output_file") or "result.xlsx")
+    if component_name == "Database_DBConnect":
+        # SQLite does not create its parent directory/file when opened by
+        # RuntimeHost. Prepare concrete local paths while materializing the
+        # component so a newly generated flow is runnable immediately.
+        _ensure_sqlite_database_file(effective_config, project_dir=project_dir)
     if component_name == "WebBrowser_CreateV3":
         target_url = str(effective_config.get("url") or state.get("target_url") or "")
         metadata_ok, metadata, _ = _safe_json(project_dir / "szrpa.json")
         metadata = metadata if metadata_ok and isinstance(metadata, dict) else {}
+        is_remote = _native_bool(effective_config.get("isRemote", False))
+        ip_address = str(effective_config.get("ipAddress") or "")
+        port = str(effective_config.get("port") or "61619")
+        browser_arguments = str(effective_config.get("arguments") or "")
         open_new_tab = _native_bool(
             effective_config.get("openNewTab", metadata.get("mcpOpenNewTab")),
             default=False,
@@ -14219,6 +16873,10 @@ def _add_native_rpa_step(
         _native_set_argument(node, "var_name", str(effective_config.get("var_name") or "网页对象"))
         _native_set_argument(node, "type", json.dumps(str(effective_config.get("type") or "chrome"), ensure_ascii=False))
         _native_set_argument(node, "url", json.dumps(target_url, ensure_ascii=False))
+        _native_set_argument(node, "isRemote", "1" if is_remote else "0")
+        _native_set_argument(node, "ipAddress", json.dumps(ip_address, ensure_ascii=False))
+        _native_set_argument(node, "port", json.dumps(port, ensure_ascii=False))
+        _native_set_argument(node, "arguments", json.dumps(browser_arguments, ensure_ascii=False))
         _native_set_argument(node, "openNewTab", "1" if open_new_tab else "0")
         _native_set_argument(node, "waitingload", "1" if _native_bool(effective_config.get("waitingload", 1)) else "0")
         step_config = {"url": target_url, "type": effective_config.get("type") or "chrome", "openNewTab": open_new_tab}
@@ -14264,12 +16922,21 @@ def _add_native_rpa_step(
         # explicit ``designated_obj=None`` remains available through the public
         # config update API, but generated browser flows use the proven output
         # binding by default.
+        designated_info = _native_bool(
+            effective_config.get("designated_info", 1 if effective_config.get("designated_obj") else 0)
+        )
+        _native_set_argument(node, "designated_info", "1" if designated_info else "0")
         _native_set_argument(node, "designated_obj", designated_obj)
         _native_set_argument(node, "text", json.dumps(native_keyword, ensure_ascii=False))
         # The model may submit here or choose a separate submit component.
         is_enter = _native_bool(effective_config.get("isEnter", False))
         _native_set_argument(node, "isEnter", "1" if is_enter else "0")
-        step_config = {"text": native_keyword, "designated_obj": designated_obj, "isEnter": is_enter}
+        step_config = {
+            "text": native_keyword,
+            "designated_info": designated_info,
+            "designated_obj": designated_obj,
+            "isEnter": is_enter,
+        }
     elif component_name == "Keyboard_Send_V1":
         # This component is the submit action in the native JD recipe.  The
         # search text is already written by Element.SetValue_V6; sending the
@@ -14370,13 +17037,27 @@ def _add_native_rpa_step(
             "isAsyncCode": "0",
             "waitResultTimeout": str(effective_config.get("waitResultTimeout", "30")),
             "generated_element_id": (
-                _upsert_js_generated_elements(paths, str(project_dir), element_id)
-                if element_id and not js_table and not plan_backed
+                (
+                    _upsert_js_generated_elements(paths, str(project_dir), element_id)
+                )
+                if element_id and not js_table and (not plan_backed or bool(workflow_reference))
                 else None
             ),
+            "generated_element_ids": [
+                JS_NAME_ELEMENT_ID,
+                JS_MERCHANT_ELEMENT_ID,
+                JS_PRICE_ELEMENT_ID,
+                JS_SALES_ELEMENT_ID,
+                JS_LINK_ELEMENT_ID,
+            ]
+            if workflow_reference == JD_PRODUCT_LINK_REFERENCE and element_id
+            else [],
             "output_mode": result_mode,
+            "workflow_reference": workflow_reference or None,
         }
     elif component_name == "WebBrowser_DataCollectionV5":
+        if str(effective_config.get("collection_output") or "").strip():
+            effective_config.setdefault("var0", str(effective_config["collection_output"]).strip())
         # Plans may bind the row target semantically (the model-facing form is
         # ``$output_contract.max_rows``). Resolve it before writing native
         # arguments so RuntimeHost receives the concrete integer it expects.
@@ -14399,11 +17080,18 @@ def _add_native_rpa_step(
         columns = [str(item).strip() for item in columns if str(item).strip()]
         if not columns:
             columns = list(DEFAULT_RPA_COLUMNS)
+        effective_config = _materialize_collection_paging_selectors(
+            paths,
+            str(project_dir),
+            effective_config,
+        )
         _, collection_elements = _element_file(paths, str(project_dir))
+        collection_element_map = collection_elements.get("elementMap")
+        collection_element_map = collection_element_map if isinstance(collection_element_map, dict) else {}
         normalized_ids = _normalize_generated_collection_bindings(
             normalized_ids,
             columns,
-            collection_elements.get("elementMap", {}),
+            collection_element_map,
         )
         if len(normalized_ids) != len(set(normalized_ids)):
             raise ValueError("WebBrowser_DataCollectionV5 has duplicate column element bindings")
@@ -14414,6 +17102,8 @@ def _add_native_rpa_step(
             keyword=native_keyword,
             columns=columns,
             data_attributes=effective_config.get("data_attributes"),
+            fallback_page_url=str(effective_config.get("page_url") or state.get("target_url") or ""),
+            fallback_page_title=str(effective_config.get("page_title") or ""),
         )
         if normalized_ids and (collection_config is None or collection_count != len(normalized_ids)):
             raise ValueError("WebBrowser_DataCollectionV5 requires reusable imported field selectors")
@@ -14426,7 +17116,10 @@ def _add_native_rpa_step(
         _apply_collection_paging_settings(node, collection_paging)
         # In explicit Excel mode the collection component hands its table to
         # Excel_Cs_WriteRange instead of creating a second output file.
-        to_excel = 0 if state.get("excel_mode") else int(effective_config.get("toExcel", 1))
+        to_excel = _collection_to_excel_setting(
+            effective_config,
+            excel_mode=bool(state.get("excel_mode")),
+        )
         _native_set_argument(node, "toExcel", str(to_excel))
         _native_set_argument(
             node,
@@ -14468,6 +17161,34 @@ def _add_native_rpa_step(
             "output_file": output_file,
             "filePath": file_path,
             "filename_suffix": [output_stem, output_extension],
+        }
+        collection_stage = _collection_stage_value({"config": effective_config})
+        if collection_stage:
+            step_config["collection_stage"] = collection_stage
+            node["mcpCollectionStage"] = collection_stage
+    elif component_name == "WebBrowser_CloseWeb_V2":
+        # Close only the browser handle returned by WebBrowser_CreateV3.  The
+        # designer spells ``close_type`` as ``colse_type`` in this component;
+        # keep the native spelling so the generated task is executable.
+        result_variable = str(effective_config.get("var_name") or "操作结果")
+        close_type = str(effective_config.get("colse_type") or "select")
+        browser_type = str(effective_config.get("browser_type") or "chrome")
+        web_object = _native_designated_object(effective_config.get("web"), default="网页对象")
+        kill = "1" if _native_bool(effective_config.get("kill", 0)) else "0"
+        close_alert = "1" if _native_bool(effective_config.get("is_close_alert", 0)) else "0"
+        _native_set_argument(node, "var_name", result_variable)
+        _native_set_argument(node, "colse_type", json.dumps(close_type, ensure_ascii=False))
+        _native_set_argument(node, "browser_type", json.dumps(browser_type, ensure_ascii=False))
+        _native_set_argument(node, "web", web_object)
+        _native_set_argument(node, "kill", kill)
+        _native_set_argument(node, "is_close_alert", close_alert)
+        step_config = {
+            "var_name": result_variable,
+            "colse_type": close_type,
+            "browser_type": browser_type,
+            "web": web_object,
+            "kill": int(kill),
+            "is_close_alert": int(close_alert),
         }
     elif component_name == "Excel_Cs_NewV4":
         output_file = str(effective_config.get("name") or native_output_file)
@@ -14558,7 +17279,13 @@ def _add_native_rpa_step(
     if not isinstance(main, dict):
         raise ValueError("native task has no MAIN_COMPONENT")
     statements = _native_statement_ids(payload)
-    statements.append(node_id)
+    normalized_before_step_id = str(before_step_id or "").strip()
+    if normalized_before_step_id:
+        if normalized_before_step_id not in statements:
+            raise ValueError(f"before_step_id is not an existing step: {normalized_before_step_id}")
+        statements.insert(statements.index(normalized_before_step_id), node_id)
+    else:
+        statements.append(node_id)
     for argument in main.setdefault("args0", []):
         if isinstance(argument, dict) and argument.get("name") == "statements":
             argument["value"] = statements
@@ -14570,6 +17297,8 @@ def _add_native_rpa_step(
     temporary.replace(task_path)
     _ensure_native_runtime_support(paths, project_dir, task_path, client=client)
     metadata_updates: dict[str, Any] = {}
+    if not state.get("mcp_managed", True):
+        metadata_updates["mcpPlanningPolicy"] = "model_decides"
     if component_name == "WebBrowser_CreateV3":
         metadata_updates.update(
             {
@@ -14610,26 +17339,100 @@ def _add_native_rpa_step(
                     {
                         _canonical_result_field(item)
                         for item in step_config.get("columns", [])
-                        if _canonical_result_field(item) in {"product_name", "merchant", "price", "sales", "link"}
+                        if _canonical_result_field(item) in _RPA_RESULT_FIELDS
                     }
                 ),
                 "mcpResultFieldElementIds": {
                     _canonical_result_field(header): element_id
                     for header, element_id in zip(step_config.get("columns", []), normalized_ids)
-                    if _canonical_result_field(header) in {"product_name", "merchant", "price", "sales", "link"}
+                    if _canonical_result_field(header) in _RPA_RESULT_FIELDS
                 },
             }
         )
     if component_name == "WebBrowser_RunJsInIeBySelector_v3":
         metadata_updates.update(
             {
-                "mcpUseJsLink": bool(step_config.get("output_mode") == "generated_markers"),
+                "mcpUseJsLink": bool(workflow_reference) or bool(step_config.get("output_mode") == "generated_markers"),
                 "mcpUseJsTable": bool(step_config.get("output_mode") == "table"),
                 "mcpMaxRows": int(state.get("max_rows") or 0),
                 "mcpJsOutputMode": step_config.get("output_mode"),
                 "mcpJsOutputVariable": step_config.get("output_variable"),
             }
         )
+    # Keep the model-facing plan in lockstep with the native task.  The old
+    # incremental writer only updated this metadata for insertions and wrote
+    # ``outputs=[]`` for every component except JavaScript.  That made native
+    # database/JSON steps fail static validation even though their live
+    # contracts expose a var_name output.  Derive logical outputs from the
+    # same contract used by plan validation and update both append and insert
+    # paths.
+    metadata_ok, metadata, _ = _safe_json(project_dir / "szrpa.json")
+    metadata = metadata if metadata_ok and isinstance(metadata, dict) else {}
+    component_plan, _ = _rpa_component_plan(metadata)
+    if isinstance(component_plan, list):
+        revised_plan = deepcopy(component_plan)
+        plan_config = deepcopy(effective_config)
+        if workflow_reference:
+            plan_config["workflow_reference"] = workflow_reference
+        logical_outputs = _logical_plan_outputs(component_name, contract, plan_config)
+        new_plan_step = {
+            "id": node_id,
+            "component": component_name,
+            "purpose": label or contract["designer_label"],
+            "config": plan_config,
+            "outputs": logical_outputs,
+        }
+        plan_changed = False
+        if normalized_before_step_id:
+            target_index = next(
+                (
+                    index
+                    for index, item in enumerate(revised_plan)
+                    if isinstance(item, dict) and str(item.get("id") or "").strip() == normalized_before_step_id
+                ),
+                None,
+            )
+            if target_index is not None:
+                target = revised_plan[target_index]
+                prior_dependencies = list(target.get("depends_on") or []) if isinstance(target, dict) else []
+                new_plan_step["depends_on"] = prior_dependencies
+                revised_plan.insert(target_index, new_plan_step)
+                plan_changed = True
+                if isinstance(target, dict):
+                    target["depends_on"] = [node_id]
+        elif any(item.get("id") == node_id for item in revised_plan):
+            # start_design seeds the complete plan before materializing nodes.
+            # Keep its content address stable; the native node is the write
+            # source and the plan already contains the model's operation ids,
+            # dependencies, and semantic output names.
+            pass
+        else:
+            prior_id = str(revised_plan[-1].get("id") or "").strip() if revised_plan else ""
+            new_plan_step["depends_on"] = [prior_id] if prior_id else []
+            revised_plan.append(new_plan_step)
+            plan_changed = True
+        # The native task owns a linear MAIN_COMPONENT statement list.  Repair
+        # stale dependencies from deleted nodes before persisting the updated
+        # model-facing plan so validation and later edits see the same graph.
+        if plan_changed:
+            _normalize_linear_plan_dependencies(revised_plan)
+            for order, item in enumerate(revised_plan, start=1):
+                if isinstance(item, dict):
+                    item["order"] = order
+            metadata_updates["mcpComponentPlan"] = revised_plan
+            execution_plan = metadata.get("mcpExecutionPlan")
+            if isinstance(execution_plan, dict):
+                revised_execution_plan = deepcopy(execution_plan)
+                revised_execution_plan["steps"] = deepcopy(revised_plan)
+                revised_execution_plan.pop("plan_id", None)
+                revised_execution_plan["plan_id"] = (
+                    "plan-"
+                    + hashlib.sha256(
+                        json.dumps(revised_execution_plan, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                    ).hexdigest()[:16]
+                )
+                metadata_updates["mcpExecutionPlan"] = revised_execution_plan
+                metadata_updates["mcpPlanId"] = revised_execution_plan["plan_id"]
     _update_native_metadata(project_dir, len(statements), metadata_updates)
     writeback = _finalize_native_writeback(paths, project_dir, task_path, client=client)
     updated = _native_rpa_state(paths, str(project_dir))
@@ -14778,6 +17581,8 @@ def _set_native_rpa_step_elements(
             columns=columns,
             data_attributes=metadata.get("mcpCollectionAttributes"),
             keyword=keyword,
+            page_url=str(metadata.get("mcpCollectionPageUrl") or metadata.get("mcpTargetUrl") or ""),
+            page_title=str(metadata.get("mcpCollectionPageTitle") or ""),
         )
         nested_collection = collection_config.get("collectionConfig") if isinstance(collection_config, dict) else None
         selectors = nested_collection.get("columnSelectorArray") if isinstance(nested_collection, dict) else None
@@ -14788,7 +17593,7 @@ def _set_native_rpa_step_elements(
         planned_collection = next(
             (
                 item.get("config")
-                for item in metadata.get("mcpComponentPlan", [])
+                for item in _rpa_component_plan(metadata)[0]
                 if isinstance(item, dict)
                 and item.get("component") == "WebBrowser_DataCollectionV5"
                 and isinstance(item.get("config"), dict)
@@ -14838,7 +17643,12 @@ def _set_native_rpa_step_elements(
                 )
             }
         )
-        _native_set_argument(node, "toExcel", "0" if metadata.get("mcpExcelMode") else "1")
+        to_excel = _collection_to_excel_setting(
+            planned_collection,
+            excel_mode=bool(metadata.get("mcpExcelMode")),
+            fallback=_native_task_argument(node, "toExcel", 1),
+        )
+        _native_set_argument(node, "toExcel", str(to_excel))
         output_path = Path(output_file)
         stem = output_path.stem or "jd-products"
         extension = output_path.suffix if output_path.suffix.casefold() in _NATIVE_OUTPUT_SUFFIXES else ".xlsx"
@@ -14860,13 +17670,13 @@ def _set_native_rpa_step_elements(
                     {
                         _canonical_result_field(item)
                         for item in synced_columns
-                        if _canonical_result_field(item) in {"product_name", "merchant", "price", "sales", "link"}
+                        if _canonical_result_field(item) in _RPA_RESULT_FIELDS
                     }
                 ),
                 "mcpResultFieldElementIds": {
                     _canonical_result_field(header): element_id
                     for header, element_id in zip(synced_columns, normalized_ids)
-                    if _canonical_result_field(header) in {"product_name", "merchant", "price", "sales", "link"}
+                    if _canonical_result_field(header) in _RPA_RESULT_FIELDS
                 },
                 "mcpRequiredColumns": synced_columns,
                 "mcpCollectionAttributes": synced_attributes,
@@ -14889,6 +17699,7 @@ def _set_native_rpa_step_elements(
             raise ValueError("generic selector binding currently supports main-flow steps only")
         element = native_elements["elementMap"][normalized_ids[0]]
         _native_set_parameter(node, "uiSelector", _native_selector_expression(normalized_ids[0], element))
+    node["mcpElementIds"] = list(normalized_ids)
     paging_before_sync = (
         _native_collection_paging_snapshot(payload)
         if component == "WebBrowser_DataCollectionV5"
@@ -14951,6 +17762,7 @@ def _native_selector_chain(element: dict[str, Any]) -> list[dict[str, Any]] | No
 
 
 _UIA_TO_WEB_TAG = {
+    "article": "article",
     "group": "div",
     "text": "span",
     "static": "span",
@@ -15094,6 +17906,27 @@ def _css_selector_properties(css_selector: str) -> list[dict[str, Any]]:
     return properties
 
 
+def _collection_chain_from_css(css_selector: str) -> list[dict[str, Any]]:
+    """Convert a simple descendant CSS selector into DataCollectionV5 nodes."""
+    css = str(css_selector or "").strip()
+    if not css or any(combinator in css for combinator in ("+", "~", ",")):
+        return []
+    tokens = [token for token in re.split(r"\s*>\s*|\s+", css) if token]
+    chain: list[dict[str, Any]] = []
+    for token in tokens:
+        tag_match = re.match(r"([A-Za-z][A-Za-z0-9-]*)", token)
+        tag = tag_match.group(1) if tag_match else "div"
+        chain.append(
+            {
+                "name": tag,
+                "type": "web",
+                "accurate": "true",
+                "props": _css_selector_properties(token),
+            }
+        )
+    return chain if _has_collection_selector(chain) else []
+
+
 def _collection_selector_chain(element: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Convert a native element chain into the web-only chain required by V5."""
     # JS recovery fields are repeated values already materialized in each
@@ -15113,19 +17946,37 @@ def _collection_selector_chain(element: dict[str, Any]) -> list[dict[str, Any]] 
                         "value": generated_marker,
                         "textValue": generated_marker,
                         "pattern": "equal",
-                        "accurate": "false",
+                        "accurate": "true",
                         "expressionValue": "",
                     }
                 ],
             }
         ]
     chain = _native_selector_chain(element)
+    native_selector = element.get("mcpNativeSelector") if isinstance(element, dict) else None
+    native_chain = native_selector.get("selector") if isinstance(native_selector, dict) else None
+    if isinstance(native_chain, list) and any(
+        isinstance(item, dict) and str(item.get("name") or "").strip().casefold() == "dataitem"
+        for item in native_chain
+    ):
+        chain = native_chain
     if not chain:
         return None
     has_web_entry = any(
         isinstance(item, dict) and str(item.get("type") or "").strip().lower() == "web" for item in chain
     )
+    web_entries = [
+        item
+        for item in chain
+        if isinstance(item, dict) and str(item.get("type") or "").strip().lower() == "web"
+    ]
+    css_selector = _selector_css(element)
+    if has_web_entry and css_selector and len(web_entries) >= 4:
+        css_chain = _collection_chain_from_css(css_selector)
+        if css_chain:
+            return css_chain
     converted: list[dict[str, Any]] = []
+    table_dataitem_depth = 0
     for item in chain:
         if not isinstance(item, dict):
             continue
@@ -15139,7 +17990,14 @@ def _collection_selector_chain(element: dict[str, Any]) -> list[dict[str, Any]] 
         else:
             if source_name_lower in _COLLECTION_CONTAINER_NAMES:
                 continue
-            tag_name = _UIA_TO_WEB_TAG.get(source_name_lower, "div")
+            if source_name_lower == "table":
+                table_dataitem_depth = 0
+                tag_name = "table"
+            elif source_name_lower == "dataitem" and any(part.get("name") == "table" for part in converted):
+                tag_name = "tr" if table_dataitem_depth == 0 else "td"
+                table_dataitem_depth += 1
+            else:
+                tag_name = _UIA_TO_WEB_TAG.get(source_name_lower, "div")
         props: list[dict[str, Any]] = []
         for raw_prop in item.get("props", []):
             prop = _selector_property_dict(raw_prop)
@@ -15150,13 +18008,22 @@ def _collection_selector_chain(element: dict[str, Any]) -> list[dict[str, Any]] 
                 continue
             if (
                 not has_web_entry
-                and source_name_lower in {"text", "static", "label"}
+                and source_name_lower in {"text", "static", "label", "dataitem"}
                 and prop_name.lower() in _DYNAMIC_TEXT_NAMES
             ):
                 continue
             value = _selector_property_value(prop)
             if not value and prop_name.lower() != "@index":
                 continue
+            if (
+                not has_web_entry
+                and prop_name.casefold() == "name"
+                and tag_name.casefold() not in {"input", "select", "textarea", "button"}
+            ):
+                # UIA Name represents accessible text. RuntimeHost's web
+                # selector contract exposes that value as lower-case
+                # ``innertext``.
+                prop_name = "innertext"
             normalized = _collection_property(prop_name, value, prop)
             if normalized:
                 props.append(normalized)
@@ -15196,10 +18063,29 @@ def _collection_selector_chain(element: dict[str, Any]) -> list[dict[str, Any]] 
         # family back here to make DataCollectionV5 align each value by row.
         card_context = element.get("card_context") if isinstance(element, dict) else None
         if isinstance(card_context, dict):
+            semantic_container = str(card_context.get("semantic_container") or "").strip().casefold()
+            if semantic_container == "article":
+                first_group = next(
+                    (index for index, part in enumerate(converted) if part.get("name") == "div"),
+                    None,
+                )
+                if first_group is not None:
+                    converted = converted[first_group:]
+                    converted[0]["name"] = "article"
+                    converted[0]["props"] = [
+                        prop
+                        for prop in converted[0].get("props", [])
+                        if str(prop.get("name") or "").casefold() != "@index"
+                    ]
+                else:
+                    converted.insert(
+                        0,
+                        {"name": "article", "type": "web", "accurate": "false", "props": []},
+                    )
             family_key = str(
                 card_context.get("family_key") or card_context.get("card_family_key") or card_context.get("class") or ""
             ).strip()
-            if family_key and not any(
+            if not semantic_container and family_key and not any(
                 any(
                     marker
                     in " ".join(
@@ -15478,6 +18364,16 @@ def _page_scope_web_entries(
             value = _selector_property_value(prop)
             if not value:
                 continue
+            if not source_is_web and name == "name" and tag.casefold() not in {
+                "input",
+                "select",
+                "textarea",
+                "button",
+            }:
+                # UIA Name is the accessible text for links and ordinary
+                # content nodes. In a DOM selector, ``name`` means the HTML
+                # name attribute and would miss <a>下一页</a> entirely.
+                name = "innertext"
             normalized = _collection_property(name, value, prop)
             if normalized:
                 expression = json.dumps(value, ensure_ascii=False)
@@ -15924,6 +18820,100 @@ def _runtime_collection_selector_chain(chain: list[dict[str, Any]]) -> list[dict
     return normalized
 
 
+def _native_table_cell_index(element: dict[str, Any]) -> int | None:
+    """Read a zero-based cell position from a captured table cell chain."""
+    native_selector = element.get("mcpNativeSelector") if isinstance(element, dict) else None
+    entries = native_selector.get("selector") if isinstance(native_selector, dict) else None
+    if not isinstance(entries, list):
+        return None
+    table_seen = False
+    table_descendants: list[dict[str, Any]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip().casefold()
+        if name == "table":
+            table_seen = True
+            table_descendants = []
+        elif table_seen and name in {"dataitem", "div", "tr", "td"}:
+            # Early MCP builds converted UIA DataItem nodes to web divs and
+            # then persisted that converted chain as mcpNativeSelector. The
+            # first descendant is the repeated row and the second is its cell.
+            table_descendants.append(item)
+    if len(table_descendants) < 2:
+        return None
+    for raw_prop in table_descendants[-1].get("props", []):
+        prop = _selector_property_dict(raw_prop)
+        if prop is None or str(prop.get("name") or "").strip().casefold() != "@index":
+            continue
+        try:
+            index = int(_selector_property_value(prop))
+        except (TypeError, ValueError):
+            return None
+        return index if index >= 0 else None
+    return None
+
+
+def _collection_css_selector_node(tag: str, css_selector: str) -> dict[str, Any]:
+    """Build one native DataCollectionV5 CSS selector node."""
+    return {
+        "name": tag,
+        "type": "web",
+        "accurate": "true",
+        "props": [
+            {
+                "name": "cssSelector",
+                "value": css_selector,
+                "pattern": "equal",
+                "accurate": "true",
+                "textValue": css_selector,
+                "expressionValue": "",
+            }
+        ],
+    }
+
+
+def _collection_selector_requires_dom_capture(element: dict[str, Any]) -> bool:
+    """Return whether a card field only has an inferred UIA-to-DOM path.
+
+    Chrome UIA exposes accessibility roles such as Group and Text. Those
+    roles do not identify the backing HTML tag, so converting them to div and
+    span can produce a syntactically valid DataCollectionV5 selector that
+    always returns zero rows. Native table cells, generated recovery markers,
+    and selectors carrying real web/CSS/XPath evidence remain usable.
+    """
+    if str(element.get("mcpGeneratedMarker") or "").strip():
+        return False
+    if _native_table_cell_index(element) is not None:
+        return False
+
+    selector = element.get("selector") if isinstance(element.get("selector"), dict) else {}
+    common = selector.get("commonProps") if isinstance(selector.get("commonProps"), dict) else {}
+    if any(_decode_selector_value(common.get(name)) for name in ("cssSelector", "xpathSelector")):
+        return False
+
+    entries = selector.get("selector") if isinstance(selector.get("selector"), list) else []
+    native_selector = (
+        element.get("mcpNativeSelector") if isinstance(element.get("mcpNativeSelector"), dict) else {}
+    )
+    native_entries = (
+        native_selector.get("selector") if isinstance(native_selector.get("selector"), list) else []
+    )
+    captured_entries = native_entries or entries
+    if not captured_entries:
+        return False
+    if any(
+        isinstance(item, dict) and str(item.get("type") or "").strip().casefold() == "web"
+        for item in captured_entries
+    ):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("name") or "").strip().casefold() in {"group", "text", "static", "label"}
+        for item in captured_entries
+    )
+
+
 def _collection_binding_diagnostics(
     elements_payload: dict[str, Any],
     element_ids: list[str],
@@ -15941,6 +18931,23 @@ def _collection_binding_diagnostics(
         header = str(columns[index]).strip() if index < len(columns) else f"字段{index + 1}"
         facts.append((element_id, header, _collection_selector_context(element)))
     issues: list[dict[str, str]] = []
+    inferred_fields = [
+        header
+        for element_id, header, _context in facts
+        if isinstance(element_map.get(element_id), dict)
+        and _collection_selector_requires_dom_capture(element_map[element_id])
+    ]
+    if inferred_fields:
+        issues.append(
+            {
+                "check": "native_collection_dom_selector",
+                "message": (
+                    "以下采集字段只有 Chrome UIA 路径，不能可靠推导网页 DOM 标签："
+                    f"{', '.join(inferred_fields)}。请用原生数据采集拾取/预览生成网页 selector，"
+                    "或使用带真实 CSS/XPath 证据的通用预处理后重新绑定；禁止把 Group/Text 猜成 div/span。"
+                ),
+            }
+        )
     card_family_keys = {
         facts_item[2].get("card_family_key") or facts_item[2].get("card_key")
         for facts_item in facts
@@ -15973,6 +18980,43 @@ def _collection_binding_diagnostics(
                     "message": f"元素 {element_id} 被识别为客服或导航链接，不能绑定到商品链接列；请重新捕获商品详情链接。",
                 }
             )
+            continue
+        if link_context.get("is_link") is False:
+            issues.append(
+                {
+                    "check": "product_link_selector",
+                    "message": f"元素 {element_id} 不是原生链接控件；请捕获单元格内的 Hyperlink/链接子节点。",
+                }
+            )
+    return issues
+
+
+def _collection_runtime_capability_diagnostics(
+    collection: dict[str, Any],
+    columns: list[Any],
+) -> list[dict[str, str]]:
+    """Report DataCollectionV5 combinations the installed runtime cannot execute."""
+    table_selector = collection.get("tableSelector") if isinstance(collection, dict) else None
+    column_configs = collection.get("columnConfigArray") if isinstance(collection, dict) else None
+    if not table_selector or not isinstance(column_configs, list):
+        return []
+    issues: list[dict[str, str]] = []
+    for index, header in enumerate(columns):
+        if str(header) not in _COLLECTION_LINK_HEADERS or index >= len(column_configs):
+            continue
+        config = column_configs[index]
+        attr = str(config.get("dataAttrName") or "").strip() if isinstance(config, dict) else ""
+        if attr.casefold() == "href":
+            issues.append(
+                {
+                    "check": "native_table_nested_link_attribute",
+                    "message": (
+                        "当前 RuntimeHost 的 DataCollectionV5 表格模式按列读取单元格文本，不能读取单元格内链接的 href；"
+                        "不要继续重试列 selector。请依据当前页面捕获证据选择通用网页预处理、非表格采集模式或其他已安装组件，"
+                        "并在运行后验证该列为真实 URL。"
+                    ),
+                }
+            )
     return issues
 
 
@@ -15983,12 +19027,15 @@ def _staged_collection_config(
     keyword: str,
     columns: list[str] | None = None,
     data_attributes: dict[str, str] | None = None,
+    fallback_page_url: str | None = None,
+    fallback_page_title: str | None = None,
 ) -> tuple[dict[str, Any] | None, int]:
     """Build DataCollectionV5 selectors from the staged native element map."""
     element_map = elements_payload.get("elementMap") if isinstance(elements_payload, dict) else None
     if not isinstance(element_map, dict):
         return None, 0
     selectors: list[list[dict[str, Any]]] = []
+    table_cell_indexes: list[int | None] = []
     titles: list[str] = []
     urls: list[str] = []
     for element_id in result_ids:
@@ -15999,6 +19046,7 @@ def _staged_collection_config(
         if not chain:
             continue
         selectors.append(_runtime_collection_selector_chain(chain))
+        table_cell_indexes.append(_native_table_cell_index(element))
         title, url = _selector_page_identity(element)
         if title:
             titles.append(title)
@@ -16009,6 +19057,23 @@ def _staged_collection_config(
     headers = [str(item).strip() for item in (columns or DEFAULT_RPA_COLUMNS) if str(item).strip()]
     if not headers:
         headers = list(DEFAULT_RPA_COLUMNS)
+    table_selector: list[dict[str, Any]] = []
+    default_column_indexes = [0] * len(selectors)
+    if len(table_cell_indexes) == len(selectors) and all(index is not None for index in table_cell_indexes):
+        # DataCollectionV5's table mode is the only native path that reliably
+        # repeats rows and paginates. It reads the selected td itself; nested
+        # attributes such as an anchor href need a separate preprocessing step.
+        table_selector = [{"name": "table", "type": "web", "accurate": "true", "props": []}]
+        default_column_indexes = [int(index) for index in table_cell_indexes if index is not None]
+        selectors = [
+            [
+                _collection_css_selector_node(
+                    "td",
+                    f"td:nth-child({int(cell_index) + 1})",
+                )
+            ]
+            for cell_index in table_cell_indexes
+        ]
     explicit_attributes = data_attributes if isinstance(data_attributes, dict) else {}
 
     def attribute_for(header: str) -> str:
@@ -16025,7 +19090,7 @@ def _staged_collection_config(
             "firstRowTitle": 0,
             "columnHeader_bk": headers[index] if index < len(headers) else f"字段{index + 1}",
             "dateType": "",
-            "defaultColumnIndex": 0,
+            "defaultColumnIndex": default_column_indexes[index],
             "columnAttributes": [],
             "dataAttrName": attribute_for(headers[index] if index < len(headers) else f"字段{index + 1}"),
             "filterConfig": [],
@@ -16033,12 +19098,10 @@ def _staged_collection_config(
         }
         for index in range(len(selectors))
     ]
-    result_url = (
-        urls[0]
-        if urls
-        else ("https://search.jd.com/Search?" + urllib.parse.urlencode({"keyword": keyword, "enc": "utf-8"}))
+    result_url = urls[0] if urls else str(fallback_page_url or "").strip()
+    result_title = _browser_selector_title(
+        titles[0] if titles else str(fallback_page_title or "").strip()
     )
-    result_title = titles[0] if titles else "京东商品搜索"
     return {
         "pageInfo": {
             "windowTitle": result_title,
@@ -16050,7 +19113,7 @@ def _staged_collection_config(
             # RuntimeHost 7.3.7 determines the repeated row from the column
             # selector chains.  Its tableSelector slot is not a generic row
             # scope and supplying a card chain there yields zero rows.
-            "tableSelector": [],
+            "tableSelector": table_selector,
             "columnSelectorArray": selectors,
             "columnConfigArray": columns,
             "mergeConfigMap": {},

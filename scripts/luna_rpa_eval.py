@@ -77,6 +77,36 @@ def tool_payload(item: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def disabled_mcp_overrides(executable: str, name: str) -> dict[str, Any]:
+    """Disable an existing MCP without creating an incomplete transport table."""
+    try:
+        probe = subprocess.run(
+            [executable, "mcp", "get", name, "--json"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        payload = json.loads(probe.stdout) if probe.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return {}
+    transport = payload.get("transport") if isinstance(payload, dict) else None
+    if not isinstance(transport, dict) or transport.get("type") != "stdio" or not transport.get("command"):
+        return {}
+    prefix = f"mcp_servers.{name}"
+    result: dict[str, Any] = {
+        f"{prefix}.command": transport["command"],
+        f"{prefix}.args": list(transport.get("args") or []),
+    }
+    if transport.get("cwd"):
+        result[f"{prefix}.cwd"] = transport["cwd"]
+    result[f"{prefix}.enabled"] = False
+    return result
+
+
 def snapshot_flows(turns: list[dict[str, Any]], destination: Path) -> list[dict[str, Any]]:
     """Read only applications explicitly created by this evaluation conversation."""
     projects = set()
@@ -111,18 +141,20 @@ class AppServer:
         self.incoming: queue.Queue[dict[str, Any]] = queue.Queue()
         self.serial = 0
         self.seen: list[dict[str, Any]] = []
-        overrides = {
-            "mcp_servers.node_repl.enabled": False,
-            "mcp_servers.cua_repl.enabled": False,
+        overrides = {}
+        for server_name in ("node_repl", "cua_repl"):
+            overrides.update(disabled_mcp_overrides(executable, server_name))
+        overrides.update({
             "mcp_servers.shizai-agent.command": sys.executable,
             "mcp_servers.shizai-agent.args": ["-m", "shizai_agent.core.mcp_server"],
             "mcp_servers.shizai-agent.env.SHIZAI_MCP_TOOL_PROFILE": profile,
+            "mcp_servers.shizai-agent.enabled": True,
             "mcp_servers.shizai-agent.startup_timeout_sec": 30,
             "mcp_servers.shizai-agent.tool_timeout_sec": 120,
             # The user authorizes fully accessible test sessions. Scope trust
             # to this injected server, without changing the global user config.
             "mcp_servers.shizai-agent.default_tools_approval_mode": "auto",
-        }
+        })
         command = [executable, "app-server", "--stdio"]
         for key, value in overrides.items():
             command += ["-c", f"{key}={json.dumps(value)}"]

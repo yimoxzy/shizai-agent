@@ -9,6 +9,7 @@ from typing import Any
 
 import click
 
+from . import __version__
 from .core import agent as agent_core
 from .core import component_catalog as component_catalog_core
 from .core import debug_session as debug_core
@@ -163,6 +164,7 @@ def _ingest_source(
 
 
 @click.group(no_args_is_help=True)
+@click.version_option(version=__version__)
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
 @click.option("--dry-run", is_flag=True, help="Do not persist session changes.")
 @click.option("--project", "project_ref", default=None, help="Active project id or path.")
@@ -576,7 +578,7 @@ def extension() -> None:
 def extension_status(ctx: click.Context) -> None:
     """Show extension installation and DeepCapture readiness without secrets."""
     try:
-        _emit(ctx, ShizaiExtensionBridge(desktop=_desktop()).status())
+        _emit(ctx, ShizaiExtensionBridge(desktop=_desktop()).status(probe_deep_capture=True))
     except (ShizaiCloudError, OSError, ValueError) as exc:
         _fail(str(exc))
 
@@ -1751,7 +1753,10 @@ def workflow_rpa_scan_page(
     "--field",
     "fields",
     multiple=True,
-    help="Semantic field to capture; repeat for product_name, merchant, price, sales, link.",
+    help=(
+        "Semantic field to capture; repeat for product_id, product_name, merchant, price, sales, "
+        "sales_metric, link."
+    ),
 )
 @click.option(
     "--field-element-id",
@@ -1803,8 +1808,13 @@ def workflow_rpa_capture_page_fields(
     """Scan and capture a coherent page-field set in one DeepCapture session."""
     if project_ref and not allow_write:
         _fail("workflow rpa-capture-page-fields with --project requires --allow-write")
-    selected_fields = fields or (
-        ("product_name", "price", "sales") if use_js_link else ("product_name", "merchant", "price", "sales", "link")
+    selected_fields = list(
+        fields
+        or (
+            ("product_id", "product_name", "price", "sales", "sales_metric")
+            if use_js_link
+            else ("product_id", "product_name", "merchant", "price", "sales", "sales_metric", "link")
+        )
     )
     overrides: dict[str, str] = {}
     for value in field_element_ids:
@@ -1815,6 +1825,20 @@ def workflow_rpa_capture_page_fields(
             _fail(f"--field-element-id must use field=id: {value}")
         overrides[field.strip()] = element_id.strip()
     try:
+        if project_ref:
+            flow = project_core.read_rpa_flow(_paths(ctx), project_ref).get("flow") or {}
+            required = project_core._result_capture_requirements(
+                flow.get("required_columns") or project_core.DEFAULT_RPA_COLUMNS,
+                use_js_link=use_js_link,
+                use_js_table=bool(flow.get("use_js_table", False)),
+            )
+            selected_fields.extend(
+                field
+                for field in project_core._RPA_RESULT_FIELD_ORDER
+                if field in required and field not in selected_fields
+            )
+        if use_js_link:
+            selected_fields = [field for field in selected_fields if field not in {"merchant", "link"}]
         bridge = ShizaiExtensionBridge(desktop=_desktop())
         session = _ensure_capture_session(bridge, project_ref or _ctx(ctx).get("project_ref"))
         result, recovery = _capture_read_with_recovery(
@@ -1845,8 +1869,19 @@ def workflow_rpa_capture_page_fields(
                 capture_source="deep_capture",
             )
             if step_id:
+                selected_field_ids = result.get("selected_field_ids") or {}
+                flow = project_core.read_rpa_flow(_paths(ctx), project_ref).get("flow") or {}
+                binding_ids = [
+                    str(selected_field_ids.get(project_core._canonical_result_field(column)) or "").strip()
+                    for column in flow.get("required_columns") or project_core.DEFAULT_RPA_COLUMNS
+                ]
+                binding_ids = [element_id for element_id in binding_ids if element_id]
                 result["binding"] = project_core.set_rpa_step_elements(
-                    _paths(ctx), project_ref, step_id, result["import"]["imported"], client=_desktop()
+                    _paths(ctx),
+                    project_ref,
+                    step_id,
+                    binding_ids or result["import"]["imported"],
+                    client=_desktop(),
                 )
             if prune_unused:
                 result["prune"] = project_core.prune_unused_rpa_elements(
@@ -2304,9 +2339,8 @@ def workflow_rpa_bind_elements(
 @click.option(
     "--region",
     type=click.Choice(["0", "2", "3"]),
-    default="3",
-    show_default=True,
-    help="DataCollectionV5 pagination region; 3 uses its row-limit mode.",
+    default=None,
+    help="DataCollectionV5 pagination region; omit to preserve the current mode.",
 )
 @click.option("--allow-write", is_flag=True, help="Allow the native task and metadata to be updated.")
 @click.pass_context
@@ -2316,7 +2350,7 @@ def workflow_rpa_bind_pagination(
     step_id: str,
     element_id: str,
     mode: str,
-    region: str,
+    region: str | None,
     allow_write: bool,
 ) -> None:
     """Bind one native pagination control without replacing collection columns."""
@@ -2383,6 +2417,109 @@ def workflow_rpa_update_step(
         _emit(ctx, exc.result)
         ctx.exit(1)
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
+        _fail(str(exc))
+
+
+@workflow.command("rpa-reload-editor")
+@click.argument("project_ref")
+@click.option("--expected-revision", required=True, help="Revision returned by rpa-read --detail edit.")
+@click.option("--ready-timeout", type=click.FloatRange(min=1, max=30), default=10, show_default=True)
+@click.option("--allow-write", is_flag=True, help="Allow the active designer editor to reload.")
+@click.pass_context
+def workflow_rpa_reload_editor(
+    ctx: click.Context, project_ref: str, expected_revision: str, ready_timeout: float, allow_write: bool
+) -> None:
+    """Reload the active designer editor after an MCP write."""
+    if not allow_write:
+        _fail("workflow rpa-reload-editor requires --allow-write")
+    try:
+        _emit(ctx, project_core.reload_rpa_editor(
+            _paths(ctx), project_ref, expected_revision=expected_revision,
+            client=_desktop(), ready_timeout=ready_timeout,
+        ))
+    except WorkflowEditError as exc:
+        _emit(ctx, exc.result)
+        ctx.exit(1)
+    except (FileNotFoundError, OSError, ValueError, ShizaiCloudError) as exc:
+        _fail(str(exc))
+
+
+@workflow.command("rpa-run-component")
+@click.argument("project_ref")
+@click.argument("step_id")
+@click.option("--expected-revision", required=True, help="Revision returned by rpa-read --detail edit.")
+@click.option("--allow-write", is_flag=True, help="Allow one native component to execute in the designer.")
+@click.pass_context
+def workflow_rpa_run_component(
+    ctx: click.Context, project_ref: str, step_id: str, expected_revision: str, allow_write: bool
+) -> None:
+    """Run exactly one component in the active designer."""
+    if not allow_write:
+        _fail("workflow rpa-run-component requires --allow-write")
+    try:
+        _emit(ctx, project_core.run_rpa_component(
+            _paths(ctx), project_ref, step_id, expected_revision=expected_revision, client=_desktop(),
+        ))
+    except WorkflowEditError as exc:
+        _emit(ctx, exc.result)
+        ctx.exit(1)
+    except (FileNotFoundError, OSError, ValueError, ShizaiCloudError) as exc:
+        _fail(str(exc))
+
+
+@workflow.command("rpa-save-editor")
+@click.argument("project_ref")
+@click.option("--expected-revision", required=True, help="Revision returned by rpa-read --detail edit.")
+@click.option("--dry-run", is_flag=True, help="Read the designer's unsaved state without saving.")
+@click.option("--allow-write", is_flag=True, help="Allow the active designer editor to save.")
+@click.pass_context
+def workflow_rpa_save_editor(
+    ctx: click.Context, project_ref: str, expected_revision: str, dry_run: bool, allow_write: bool
+) -> None:
+    """Save the active designer editor and verify the persisted revision."""
+    if not allow_write and not dry_run:
+        _fail("workflow rpa-save-editor requires --allow-write")
+    try:
+        _emit(ctx, project_core.save_rpa_editor(
+            _paths(ctx), project_ref, expected_revision=expected_revision,
+            dry_run=dry_run, client=None if dry_run else _desktop(),
+        ))
+    except WorkflowEditError as exc:
+        _emit(ctx, exc.result)
+        ctx.exit(1)
+    except (FileNotFoundError, OSError, ValueError, ShizaiCloudError) as exc:
+        _fail(str(exc))
+
+
+@workflow.command("rpa-remove-step")
+@click.argument("project_ref")
+@click.argument("step_id")
+@click.option("--expected-revision", required=True, help="Revision returned by rpa-read --detail edit.")
+@click.option("--allow-dependents", is_flag=True, help="Force removal even when a later step reads this step's output.")
+@click.option("--dry-run", is_flag=True, help="Preview the removal without writes or desktop control.")
+@click.option("--allow-write", is_flag=True, help="Allow the native task and runtime artifacts to be updated.")
+@click.pass_context
+def workflow_rpa_remove_step(
+    ctx: click.Context,
+    project_ref: str,
+    step_id: str,
+    expected_revision: str,
+    allow_dependents: bool,
+    dry_run: bool,
+    allow_write: bool,
+) -> None:
+    """Delete one main-flow step and rebuild the native runtime artifacts."""
+    if not allow_write and not dry_run:
+        _fail("workflow rpa-remove-step requires --allow-write")
+    try:
+        _emit(ctx, project_core.remove_rpa_step(
+            _paths(ctx), project_ref, step_id, expected_revision=expected_revision,
+            client=None if dry_run else _desktop(), allow_dependents=allow_dependents, dry_run=dry_run,
+        ))
+    except WorkflowEditError as exc:
+        _emit(ctx, exc.result)
+        ctx.exit(1)
+    except (FileNotFoundError, OSError, ValueError, ShizaiCloudError) as exc:
         _fail(str(exc))
 
 

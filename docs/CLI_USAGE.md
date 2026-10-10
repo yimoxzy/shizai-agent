@@ -354,6 +354,38 @@ PowerShell 多行命令中，反引号必须位于上一行末尾；为了避免
 重排成功只代表原生任务和运行文件一致，不代表元素已经绑定或业务运行成功；之后仍必须执行
 `rpa-bind-elements`、`rpa-validate-step`、`rpa-validate --strict`，再做单步 RuntimeHost 验证。
 
+清理不再需要的历史节点（例如旧的 JS 预处理步骤）时，先用 `--dry-run` 预览，再带同一个 revision 提交：
+
+```powershell
+& $Py -m shizai_agent --json workflow rpa-remove-step "PROJECT_PATH" "STEP_ID" `
+  --expected-revision "REVISION" `
+  --dry-run
+
+& $Py -m shizai_agent --json workflow rpa-remove-step "PROJECT_PATH" "STEP_ID" `
+  --expected-revision "REVISION" `
+  --allow-write
+```
+
+被删步骤的输出变量若仍被下游步骤引用，命令返回 `step_has_dependents` 与引用它的步骤；应先改绑下游，
+确需强删才追加 `--allow-dependents`。删除和重排一样会重新物化，之后仍需 `rpa-read --detail edit`、
+刷新编辑器并单组件复核。
+
+活动 editor 有人工未保存修改时，先保存再运行或单组件复核：
+
+```powershell
+& $Py -m shizai_agent --json workflow rpa-save-editor "PROJECT_PATH" `
+  --expected-revision "REVISION" `
+  --dry-run
+
+& $Py -m shizai_agent --json workflow rpa-save-editor "PROJECT_PATH" `
+  --expected-revision "REVISION" `
+  --allow-write
+```
+
+保存会转发 `PackageSaveService.saveAll`，随后复核未保存状态、revision 和步骤列表。仍是脏状态时返回
+`save_unconfirmed` 与 `retryable=true`，不会谎报成功。完整运行和调试启动在 editor 有未保存修改时
+直接返回 `editor_unsaved_changes`，并给出本条命令作为下一步；没有打开 editor 时不会阻断。
+
 ### 8.5 浏览器窗口、页面树和元素捕获
 
 创建或打开浏览器后，先查看可用窗口：
@@ -1032,7 +1064,10 @@ CLI 帮助始终优先于本文档：
 `workflow rpa-update-step --flow PROJECT_PATH --step-id NODE_ID --config-json JSON --dry-run`
 只预览差异，不需要 `--allow-write`。提交时移除 `--dry-run`，增加 `--allow-write` 和
 `--expected-revision REVISION`。旧版本冲突输出结构化 `revision_conflict`，退出码为 1。
-流程图删除、插入和重排不属于这个参数接口。完整示例见 [持续编辑](SMALL_MODEL_WORKFLOWS.md)。
+流程图插入和重排不属于这个参数接口。主流程步骤删除单独用
+`workflow rpa-remove-step PROJECT_PATH STEP_ID --expected-revision REVISION`
+（先加 `--dry-run` 预览，提交再加 `--allow-write`）。完整示例见
+[持续编辑](SMALL_MODEL_WORKFLOWS.md)。
 
 ## 计划分析和预检补充
 

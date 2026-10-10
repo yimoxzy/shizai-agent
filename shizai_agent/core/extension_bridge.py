@@ -23,7 +23,7 @@ from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from .cloud_api import ShizaiCloudConfig, ShizaiCloudError, ShizaiDesktopAgent
 
@@ -31,8 +31,9 @@ DEEP_CAPTURE_SERVICE = "DeepCaptureService"
 DEFAULT_CAPTURE_LEVEL = 6
 DEFAULT_CAPTURE_MODE = 2
 DEFAULT_CAPTURE_RPC_TIMEOUT = 6.0
-DEFAULT_CAPTURE_OPERATION_TIMEOUT = 20.0
+DEFAULT_CAPTURE_OPERATION_TIMEOUT = 45.0
 DEFAULT_CAPTURE_READ_ATTEMPTS = 2
+DEFAULT_CAPTURE_SESSION_PROBE_TIMEOUT = 1.0
 _UIA_WEB_CONTROL_NAMES = {
     # English UIA control names used by Chrome's accessibility provider.
     "edit",
@@ -56,6 +57,7 @@ _UIA_WEB_CONTROL_NAMES = {
     "radiobutton",
     "heading",
     "group",
+    "article",
     # Localized names returned by some versions of the native extension.
     "文档",
     "文本框",
@@ -75,6 +77,7 @@ _UIA_WEB_CONTROL_NAMES = {
     "单选按钮",
     "标题",
     "区域",
+    "文章",
 }
 _READ_ONLY_METHODS = {
     "getDeepCaptureElementChildrenById",
@@ -362,6 +365,7 @@ def _write_capture_session_state(package_path: str | Path, payload: dict[str, An
 _SEMANTIC_FIELDS: dict[str, tuple[str, ...]] = {
     "search": ("搜索", "搜索框", "输入框", "search", "keyword", "关键词", "输入", "查找", "检索"),
     "submit": ("搜索按钮", "搜索", "提交", "确定", "查询", "search", "submit"),
+    "product_id": ("商品编号", "商品ID", "货号", "SKU", "product id", "product_id", "sku"),
     "product_name": (
         "商品名称",
         "商品名",
@@ -391,6 +395,7 @@ _SEMANTIC_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "price": ("价格", "售价", "折后价", "price", "cost", "￥", "¥"),
     "sales": ("销量", "销售量", "销售", "已售", "成交", "volume", "sales volume", "sales", "sold", "orders"),
+    "sales_metric": ("指标口径", "销量口径", "统计口径", "metric", "sales metric"),
     "link": ("链接", "网址", "详情", "link", "href", "url"),
 }
 _SEARCH_BOX_QUERY_ALIASES = {
@@ -572,6 +577,8 @@ def _runtime_extension_status() -> dict[str, Any]:
         disable_reason_labels = [
             _CHROME_EXTENSION_DISABLE_REASONS.get(reason, f"unknown_{reason}") for reason in normalized_disable_reasons
         ]
+        action = manifest.get("action")
+        action = action if isinstance(action, dict) else {}
         extensions.append(
             {
                 "id": extension_id,
@@ -582,7 +589,7 @@ def _runtime_extension_status() -> dict[str, Any]:
                 "manifest_version": manifest.get("manifest_version"),
                 "version": manifest.get("version"),
                 "name": manifest.get("name"),
-                "popup": ((manifest.get("action") or {}).get("default_popup")),
+                "popup": action.get("default_popup"),
                 "path": str(manifest_path.parent) if manifest_path is not None else None,
             }
         )
@@ -1190,8 +1197,24 @@ _CARD_CLASS_MARKERS = (
     "skuitem",
     "card",
 )
-_CAPTURE_FIELD_NAMES = ("product_name", "merchant", "price", "sales", "link")
+_SEMANTIC_CARD_TAGS = {
+    "article": "article",
+    "文章": "article",
+}
+_CAPTURE_FIELD_NAMES = (
+    "product_id",
+    "product_name",
+    "merchant",
+    "price",
+    "sales",
+    "sales_metric",
+    "link",
+)
 _CAPTURE_FIELD_ALIASES = {
+    "商品编号": "product_id",
+    "商品ID": "product_id",
+    "货号": "product_id",
+    "SKU": "product_id",
     "商品名称": "product_name",
     "商品名": "product_name",
     "商家名称": "merchant",
@@ -1199,15 +1222,24 @@ _CAPTURE_FIELD_ALIASES = {
     "店铺": "merchant",
     "价格": "price",
     "销量": "sales",
+    "销量原文": "sales",
+    "指标口径": "sales_metric",
+    "销量口径": "sales_metric",
+    "统计口径": "sales_metric",
     "商品链接": "link",
     "链接": "link",
 }
+_CAPTURE_VALUE_LABELS = {
+    alias.casefold(): canonical
+    for alias, canonical in _CAPTURE_FIELD_ALIASES.items()
+    if alias not in {"商家", "店铺", "销量", "链接"}
+}
 
-# A live JD page exposes product-card ancestry only after the candidate is
-# captured.  Keep the public candidate_limit small, but probe a larger bounded
-# window on real pages so fields can be aligned by the same card instance.
-_LIVE_FIELD_PROBE_LIMIT = 12
-_LIVE_FIELD_EXPANSION_LIMIT = 64
+# Product pages can expose hundreds of candidate nodes. Each native selector
+# costs two DeepCapture RPCs, so probe in small batches and expand only when a
+# successful batch proves that more candidates are useful.
+_LIVE_FIELD_PROBE_LIMIT = 4
+_LIVE_FIELD_EXPANSION_LIMIT = 12
 
 
 def _node_card_context(
@@ -1219,21 +1251,26 @@ def _node_card_context(
     classes = " ".join(properties.get("class", []))
     folded_classes = classes.casefold().replace("_", "")
     marker = next((item for item in _CARD_CLASS_MARKERS if item in folded_classes), None)
-    if not marker:
+    semantic_tag = _SEMANTIC_CARD_TAGS.get(_node_tag(node).casefold())
+    if not marker and not semantic_tag:
         return inherited
     index = next((item for item in properties.get("@index", []) if item != ""), "")
     normalized_class = " ".join(classes.split())
-    family_key = normalized_class or marker
-    instance_key = f"{family_key}|@index={index or 'unknown'}"
+    family_key = normalized_class or f"semantic:{semantic_tag}"
+    element_id = str(node.get("elementId") or "").strip()
+    instance_identity = f"@index={index}" if index else f"element_id={element_id or 'unknown'}"
+    instance_key = f"{family_key}|{instance_identity}"
     return {
         # Keep the historical strict key while exposing a stable container
         # family for pages whose fields live in separate UIA subtrees.
         "key": instance_key,
         "instance_key": instance_key,
         "family_key": family_key,
-        "marker": marker,
+        "marker": marker or semantic_tag,
         "class": normalized_class,
         "index": index or None,
+        "element_id": element_id or None,
+        "semantic_container": semantic_tag,
         "source": "tree_hint",
     }
 
@@ -1251,11 +1288,24 @@ def _is_product_title_candidate(
     if any(marker in normalized for marker in _PRODUCT_BADGE_MARKERS):
         return False
     normalized_tag = str(tag or "").casefold()
-    if normalized_tag not in {"text", "static", "label", "文本", "静态文本", "标签", "标题"}:
+    text_controls = {"text", "static", "label", "文本", "静态文本", "标签", "标题"}
+    link_controls = {"hyperlink", "link", "a", "超链接", "链接"}
+    if normalized_tag not in text_controls | link_controls:
         return False
+    if normalized_tag in link_controls:
+        if len(normalized) < 12 or any(marker in normalized.casefold() for marker in _LINK_NOISE_MARKERS):
+            return False
+        return True
     # A card ancestor is the reliable signal on a real result page. For
     # generic fixtures, retain the older mobile-keyword heuristic below.
-    return bool(card_context) or any(token in normalized for token in ("手机", "旗舰", "型号"))
+    return (
+        bool(card_context)
+        or any(token in normalized for token in ("手机", "电脑", "旗舰", "型号"))
+        or (
+            len(normalized) >= 12
+            and (len(normalized) >= 18 or bool(re.search(r"[A-Za-z0-9]", normalized)))
+        )
+    )
 
 
 def _semantic_matches(
@@ -1317,7 +1367,7 @@ def _semantic_matches(
     # level is a stronger title signal than the generic text control type.
     if (
         _is_product_title_candidate(shape_label, tag=normalized_tag, card_context=card_context)
-        and len(tuple(path)) >= 5
+        and (len(tuple(path)) >= 5 or len(shape_label) >= 12)
     ):
         scores["product_name"] = max(
             scores.get("product_name", 0),
@@ -1387,6 +1437,7 @@ def _scan_tree_nodes(
         inherited_card: dict[str, Any] | None = None,
     ) -> None:
         nonlocal scan_order
+        pending_value_field: str | None = None
         if len(result) >= max_nodes:
             return
         for item in items:
@@ -1412,6 +1463,16 @@ def _scan_tree_nodes(
                 properties=properties,
                 card_context=current_card,
             )
+            label_field = _CAPTURE_VALUE_LABELS.get(label.strip().casefold())
+            if label_field:
+                # Accessibility trees often flatten ``<b>label</b> value``
+                # into adjacent text nodes. Select the value, not its label.
+                semantic.pop(label_field, None)
+                pending_value_field = label_field
+            elif label and pending_value_field:
+                semantic[pending_value_field] = max(semantic.get(pending_value_field, 0), 12)
+                score = max(score, 12)
+                pending_value_field = None
             editable = _node_is_editable(item)
             search_input = editable and (
                 any(token in searchable.casefold() for token in ("搜索", "search", "keyword", "query", "检索"))
@@ -1695,6 +1756,24 @@ def _candidate_is_link_noise(candidate: dict[str, Any]) -> bool:
     return any(marker.casefold() in haystack for marker in _LINK_NOISE_MARKERS)
 
 
+def _candidate_is_native_link(candidate: dict[str, Any]) -> bool:
+    """Prefer the actual link control over its accessible parent cell."""
+    control = " ".join(
+        str(candidate.get(key) or "").strip().casefold() for key in ("tag", "role")
+    )
+    return any(token in control for token in ("hyperlink", "link", "链接", "超链接"))
+
+
+def _candidate_link_url(candidate: dict[str, Any], page_url: str = "") -> str:
+    """Resolve an extension-observed href without treating visible text as a URL."""
+    hint = candidate.get("selector_hint")
+    href = str(hint.get("href") or "").strip() if isinstance(hint, dict) else ""
+    if not href:
+        return ""
+    resolved = urljoin(str(page_url or "").strip(), href)
+    return resolved if urlsplit(resolved).scheme.casefold() in {"http", "https"} else ""
+
+
 def _candidate_is_merchant_badge(candidate: dict[str, Any]) -> bool:
     """Reject JD fulfillment badges when selecting a store-name field."""
     tag = str(candidate.get("tag") or candidate.get("role") or "").casefold()
@@ -1738,10 +1817,15 @@ def _element_record(
     element_detail = selector_dict.get("elementDetail")
     element_detail = element_detail if isinstance(element_detail, dict) else {}
     selector_title, selector_url = _selector_context(selector_dict)
-    title = str(page_title or selector_title or element_detail.get("categoryName") or "").strip()
+    # The scan-level identity is only a hint from the discovered Chrome
+    # window. Chrome can expose a transient "restore pages" shell while the
+    # exact element selector already names the real renderer page. Prefer the
+    # selector captured from this element so one unrelated shell cannot poison
+    # every field imported by capture_page_fields.
+    title = str(selector_title or page_title or element_detail.get("categoryName") or "").strip()
     if not title:
         title = _window_title(detail_dict)
-    resolved_url = str(page_url or selector_url or "").strip()
+    resolved_url = str(selector_url or page_url or "").strip()
     common = selector_dict.get("commonProps")
     common = common if isinstance(common, dict) else {}
     process_name = str(common.get("processName") or "chrome.exe").strip()
@@ -1820,6 +1904,102 @@ def _enum_windows() -> Iterable[tuple[int, str]]:
 
     user32.EnumWindows(callback, 0)
     return visible
+
+
+def _foreground_window_id() -> int:
+    """Return the current foreground window handle, or 0 when unavailable."""
+    if os.name != "nt":
+        return 0
+    return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+
+
+def _win32_window_text(hwnd: int) -> str:
+    """Read one Win32 window's title without enumerating every window."""
+    if os.name != "nt" or not hwnd:
+        return ""
+    user32 = ctypes.windll.user32
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    title = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, title, length + 1)
+    return title.value
+
+
+def _activate_window(hwnd: int) -> bool:
+    """Restore and foreground one window, reporting whether Windows accepted it."""
+    if os.name != "nt" or not hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+    return _foreground_window_id() == int(hwnd)
+
+
+def check_chrome_window_focus(
+    *,
+    expected_title: str | None = None,
+    expected_url: str | None = None,
+    activate: bool = True,
+) -> dict[str, Any]:
+    """Report whether the expected Chrome window currently owns the keyboard focus.
+
+    Global keyboard components send real keystrokes to whichever window has the
+    focus, so this is the difference between a verified run and a silent misfire.
+    Win32 window enumeration exposes the page title but not the page URL, so a
+    flow that carries a URL without a title cannot be tied to a window here and
+    reports ``target_window_unknown`` instead of assuming success.
+    """
+    expected_title_text = str(expected_title or "").strip()
+    expected_url_text = str(expected_url or "").strip()
+    result: dict[str, Any] = {
+        "expected_page_title": expected_title_text,
+        "expected_page_url": expected_url_text,
+        "focused": False,
+        "hwnd": 0,
+        "title": "",
+        "activated": False,
+        "foreground_hwnd": 0,
+        "foreground_title": "",
+        "reason": "target_window_unknown",
+    }
+    if os.name != "nt":
+        result["reason"] = "unsupported_platform"
+        return result
+    if not expected_title_text:
+        # A URL alone cannot identify a Win32 window: the enumeration exposes
+        # the page title only, so an unidentifiable target stays unverified.
+        return result
+    windows = list(_enum_windows())
+    if not windows:
+        result["reason"] = "chrome_not_found"
+        return result
+    matching = [
+        (hwnd, title)
+        for hwnd, title in windows
+        if _page_titles_match(expected_title_text, title)
+    ]
+    if not matching:
+        return result
+    hwnd, title = matching[0]
+    result.update({"hwnd": hwnd, "title": title})
+    foreground = _foreground_window_id()
+    result.update({"foreground_hwnd": foreground, "foreground_title": _win32_window_text(foreground)})
+    if foreground == hwnd:
+        result.update({"focused": True, "reason": "focused"})
+        return result
+    if activate:
+        result["activated"] = _activate_window(hwnd)
+        foreground = _foreground_window_id()
+        result.update({"foreground_hwnd": foreground, "foreground_title": _win32_window_text(foreground)})
+        if foreground == hwnd:
+            result.update({"focused": True, "reason": "focused"})
+            return result
+    # Windows may refuse the foreground request while another process owns the
+    # foreground lock.  Report the failure instead of assuming the keys landed.
+    result["reason"] = "window_focus_unverified"
+    return result
 
 
 def _chrome_executable_candidates() -> list[Path]:
@@ -1951,18 +2131,39 @@ class ShizaiExtensionBridge:
                 ) from exc
             raise
 
-    def status(self, *, timeout: float | None = None) -> dict[str, Any]:
+    def status(
+        self,
+        *,
+        timeout: float | None = None,
+        probe_deep_capture: bool = False,
+    ) -> dict[str, Any]:
         installation = _extension_installation()
         _read_manifest(installation)
         try:
             auth = self._capture_desktop(timeout).authentication_status()
         except (ShizaiCloudError, OSError, TimeoutError, ValueError) as exc:
             auth = {"ready": False, "error": str(exc)}
+        deep_capture_rpc = bool(auth.get("ready"))
+        deep_capture_probe: dict[str, Any] = {"checked": False, "ok": None}
+        if probe_deep_capture and deep_capture_rpc:
+            try:
+                _payload, attempts = self._call_read_with_retry(
+                    "getDeepCaptureElementChildrenById",
+                    [""],
+                    max_attempts=1,
+                    timeout=min(DEFAULT_CAPTURE_SESSION_PROBE_TIMEOUT, self.capture_rpc_timeout),
+                )
+                deep_capture_probe = {"checked": True, "ok": True, "attempts": attempts}
+            except (ShizaiCloudError, OSError, TimeoutError, ValueError) as exc:
+                deep_capture_rpc = False
+                deep_capture_probe = {"checked": True, "ok": False, "error": str(exc)}
         status = {
             "backend": "shizai-agent-native-extension",
             "installation": installation,
             "desktop": auth,
-            "deep_capture_rpc": bool(auth.get("ready")),
+            "deep_capture_rpc": deep_capture_rpc,
+            "deep_capture_rpc_verified": bool(deep_capture_probe["checked"]),
+            "deep_capture_probe": deep_capture_probe,
             "uses_current_chrome_profile": True,
             "requires_separate_codex_extension": False,
             "runtime_extension": _runtime_extension_status(),
@@ -2101,6 +2302,7 @@ class ShizaiExtensionBridge:
         args: list[Any],
         *,
         max_attempts: int = DEFAULT_CAPTURE_READ_ATTEMPTS,
+        timeout: float | None = None,
     ) -> tuple[Any, int]:
         """Retry only transient failures on read-only DeepCapture RPCs.
 
@@ -2115,12 +2317,15 @@ class ShizaiExtensionBridge:
         for attempt in range(1, attempts + 1):
             try:
                 remaining = self._remaining_timeout()
+                call_timeout = self.capture_rpc_timeout
+                if timeout is not None:
+                    call_timeout = min(call_timeout, max(0.1, float(timeout)))
                 return self.call(
                     method,
                     args,
-                    timeout=min(self.capture_rpc_timeout, remaining)
+                    timeout=min(call_timeout, remaining)
                     if remaining is not None
-                    else self.capture_rpc_timeout,
+                    else call_timeout,
                 ), attempt
             except (ShizaiCloudError, OSError, TimeoutError) as exc:
                 last_error = exc
@@ -2357,7 +2562,10 @@ class ShizaiExtensionBridge:
                 # still alive. One bounded root read is enough to validate the
                 # durable handshake without invalidating session-scoped ids.
                 _capture, probe_attempts = self._call_read_with_retry(
-                    "getDeepCaptureElementChildrenById", [""], max_attempts=1
+                    "getDeepCaptureElementChildrenById",
+                    [""],
+                    max_attempts=1,
+                    timeout=min(DEFAULT_CAPTURE_SESSION_PROBE_TIMEOUT, self.capture_rpc_timeout),
                 )
             except (ShizaiCloudError, OSError, TimeoutError) as exc:
                 result = self.start_capture_session(package_path=normalized)
@@ -2706,13 +2914,14 @@ class ShizaiExtensionBridge:
         resolved_page_url = str(page_url or "").strip()
         targeted = None
         query_kind = _query_semantic_fields(query)[1]
-        if strategy in {"auto", "targeted"} and not requested_root and query_kind in {"search_box", "submit"}:
+        if strategy in {"auto", "targeted"} and query_kind in {"search_box", "submit"}:
             targeted = self._targeted_page_search(
                 query=query,
                 level=level,
                 max_nodes=max_nodes,
                 page_title=resolved_page_title,
                 page_url=resolved_page_url,
+                root_element_id=requested_root,
             )
             if targeted:
                 resolved_page_title = resolved_page_title or str(targeted.get("page_title") or "").strip()
@@ -2761,7 +2970,8 @@ class ShizaiExtensionBridge:
                 },
             )
 
-        targeted_success = bool(targeted and page_candidates)
+        targeted_attempted = targeted is not None
+        targeted_success = bool(targeted and targeted.get("candidates"))
         if targeted_success:
             # The bounded walk already inspected the selected controls.  Do
             # not immediately traverse the whole Document again; that would
@@ -2828,6 +3038,10 @@ class ShizaiExtensionBridge:
                     candidate["document_id"] = document_id
                     candidate["page_title"] = resolved_page_title
                     candidate["page_url"] = resolved_page_url
+                    element_url = _candidate_link_url(candidate, resolved_page_url)
+                    if element_url:
+                        candidate["element_url"] = element_url
+                        candidate["url_attribute"] = "href"
                 page_candidates.extend(candidates)
                 visible_text.extend(_tree_text(document_tree.get("descendants", [])))
                 if len(page_candidates) >= max_nodes:
@@ -2889,8 +3103,8 @@ class ShizaiExtensionBridge:
             "page_url": resolved_page_url,
             "level": level,
             "max_nodes": max_nodes,
-            "scan_strategy": "targeted" if targeted and page_candidates else "full",
-            "targeted_fallback": bool(targeted is not None and not page_candidates),
+            "scan_strategy": "targeted" if targeted_success else "full",
+            "targeted_fallback": bool(targeted_attempted and not targeted_success),
             "targeted_nodes_visited": int((targeted or {}).get("nodes_visited") or 0),
             "targeted_rpc_calls": int((targeted or {}).get("rpc_calls") or 0),
             "targeted_elapsed_ms": (targeted or {}).get("elapsed_ms"),
@@ -2917,7 +3131,9 @@ class ShizaiExtensionBridge:
             },
             "message": (
                 "已从当前页面 Document 子树扫描候选元素；选择 element_id 后调用 shizai_rpa_capture_elements 获取完整 native selector。"
-                if ready
+                if unique_candidates
+                else "当前页面已暴露 Document，但本次查询没有匹配候选；清空或缩短 query 后重扫当前页面。"
+                if document_ids
                 else "当前没有找到 Document 页面节点；请保持当前 Chrome 页面打开，先写入计划中的元素组件，再按该 project_ref + step_id 启动官方拾取。"
             ),
             "next_action": {
@@ -2933,9 +3149,40 @@ class ShizaiExtensionBridge:
             }
             if unique_candidates
             else {
-                "tool": "shizai_extension_start_capture",
-                "arguments": {"allow_write": True, "mode": DEFAULT_CAPTURE_MODE},
-                "reason": "返回流程编排层补齐已存在 unbound 组件的 project_ref + step_id 后，再启动官方拾取。",
+                "tool": "shizai_rpa_scan_page",
+                "arguments": {
+                    "query": "",
+                    "level": min(20, max(int(level), 6)),
+                    "max_nodes": min(1000, max(int(max_nodes), 500)),
+                },
+                "reason": "Document 已存在，只是当前语义查询没有匹配；放宽查询后在同一页面重扫。",
+            }
+            if document_ids
+            else {
+                "tool": "shizai_rpa_component_catalog",
+                "arguments": {
+                    "scope": "builtin",
+                    "component_type": "WebBrowser_RunJsInIeBySelector_v3",
+                    "detail": "contract",
+                    "limit": 5,
+                },
+                "reason": (
+                    "当前扩展没有暴露 Document，自动 selector 路径不可用；若任务要求全自动，"
+                    "先评估无需元素绑定的原生网页 JS 组件。只有用户愿意在页面点击目标时才启动官方拾取。"
+                ),
+            },
+            "selector_discovery": {
+                "automatic_available": bool(document_ids),
+                "reason": None if document_ids else "document_missing",
+                "automatic_fallback": "WebBrowser_RunJsInIeBySelector_v3" if not document_ids else None,
+                "interactive_fallback": {
+                    "tool": "shizai_extension_start_capture",
+                    "arguments": {"allow_write": True, "mode": DEFAULT_CAPTURE_MODE},
+                    "requires_user_click": True,
+                }
+                if not document_ids
+                else None,
+                "rule": "官方拾取需要用户点击；全自动任务不得把启动拾取层当作元素已经捕获。",
             },
             "status": self.status(timeout=self._remaining_timeout()),
             "ui_feedback": ui_feedback,
@@ -2957,6 +3204,7 @@ class ShizaiExtensionBridge:
         max_nodes: int,
         page_title: str,
         page_url: str,
+        root_element_id: str = "",
     ) -> dict[str, Any] | None:
         """Find a small set of interactive controls without materializing the full page tree.
 
@@ -2967,7 +3215,10 @@ class ShizaiExtensionBridge:
         """
         started = time.perf_counter()
         max_visit = min(160, max(24, int(max_nodes) * 2))
-        max_depth = min(12, max(4, int(level) + 3))
+        # Chrome commonly places the renderer Document below tab-strip and
+        # toolbar containers. Keep targeted scans bounded, but do not let a
+        # caller's shallow level force the expensive full-tree fallback.
+        max_depth = min(12, max(9, int(level) + 3))
         rpc_calls = 0
         nodes_visited = 0
 
@@ -3000,8 +3251,19 @@ class ShizaiExtensionBridge:
 
         # Search controls are normally shallow. Avoid the detail/selector RPCs
         # for every Chrome window until a candidate has actually been found.
-        windows = self.capture_windows(resolve_context=False)
-        window_rows = [item for item in windows.get("windows", []) if isinstance(item, dict)]
+        requested_root = str(root_element_id or "").strip()
+        if requested_root:
+            window_rows = [
+                {
+                    "element_id": requested_root,
+                    "title": page_title,
+                    "page_title": page_title,
+                    "page_url": page_url,
+                }
+            ]
+        else:
+            windows = self.capture_windows(resolve_context=False)
+            window_rows = [item for item in windows.get("windows", []) if isinstance(item, dict)]
         if not window_rows:
             return None
         document_ids: list[str] = []
@@ -3446,6 +3708,8 @@ class ShizaiExtensionBridge:
         element_id = str(element_id).strip()
         if not element_id:
             raise ValueError("element_id must not be empty")
+        started = time.perf_counter()
+        rpc_calls = 0
         _set_capture_ui_feedback(
             "capturing",
             "element_capture",
@@ -3455,7 +3719,9 @@ class ShizaiExtensionBridge:
         )
         try:
             detail = _unwrap(self._capture_rpc_call("getDeepCaptureElementDetail", [element_id]))
+            rpc_calls += 1
             selector = _unwrap(self._capture_rpc_call("getDeepCaptureElementSelector", [element_id]))
+            rpc_calls += 1
             selector_dict = _native_selector(selector)
             if not selector_dict or not _tree_has_web_element(selector_dict.get("selector", [])):
                 raise ShizaiCloudError(
@@ -3493,6 +3759,8 @@ class ShizaiExtensionBridge:
             "record": record,
             "detail": detail,
             "selector": record["selector"],
+            "selector_rpc_calls": rpc_calls,
+            "selector_capture_elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
             "status": self.status(timeout=self._remaining_timeout()),
             "ui_feedback": ui_feedback,
         }
@@ -3624,12 +3892,25 @@ class ShizaiExtensionBridge:
                 if field in (item.get("semantic_fields") or []) and str(item.get("element_id") or "").strip()
             ]
             if field == "link":
-                field_candidates = [item for item in field_candidates if not _candidate_is_link_noise(item)]
+                field_candidates = [
+                    item
+                    for item in field_candidates
+                    if not _candidate_is_link_noise(item)
+                    and (
+                        bool(_candidate_card_key(item))
+                        or {"product_name", "link"}.issubset(set(item.get("semantic_fields") or []))
+                    )
+                ]
             if field == "merchant":
                 field_candidates = [item for item in field_candidates if not _candidate_is_merchant_badge(item)]
             field_candidates.sort(
                 key=lambda item: (
                     -int(bool(_candidate_card_key(item))),
+                    -int(field == "link" and _candidate_is_native_link(item)),
+                    -int(
+                        field in {"product_name", "link"}
+                        and {"product_name", "link"}.issubset(set(item.get("semantic_fields") or []))
+                    ),
                     -int(item.get("semantic_score", 0) or 0),
                     int(item.get("scan_order", 0) or 0),
                 )
@@ -3680,21 +3961,31 @@ class ShizaiExtensionBridge:
                 if element_id and element_id not in group["element_ids"]:
                     group["element_ids"].append(element_id)
 
-        hinted_group = next(
-            (
-                item
-                for item in sorted(
-                    hint_groups.values(),
-                    key=lambda value: (
-                        -len(set(value.get("fields", {})) & set(required_fields)),
-                        -len(value.get("element_ids", [])),
-                        str(value.get("key", "")),
-                    ),
-                )
-                if set(required_fields).issubset(item.get("fields", {}))
+        ranked_hint_groups = sorted(
+            hint_groups.values(),
+            key=lambda value: (
+                -len(set(value.get("fields", {})) & set(required_fields)),
+                -len(value.get("element_ids", [])),
+                str(value.get("key", "")),
             ),
+        )
+        hinted_group = next(
+            (item for item in ranked_hint_groups if set(required_fields).issubset(item.get("fields", {}))),
             None,
         )
+        if hinted_group is None and len(required_fields) >= 3:
+            # A browser accessibility tree may omit href while still exposing
+            # a coherent card's title, price, and sales. Prefer that nearly
+            # complete card before probing unrelated high-score candidates.
+            minimum_coverage = max(2, len(required_fields) - 1)
+            hinted_group = next(
+                (
+                    item
+                    for item in ranked_hint_groups
+                    if len(set(item.get("fields", {})) & set(required_fields)) >= minimum_coverage
+                ),
+                None,
+            )
 
         live_scan = int(scan.get("candidate_count", 0) or 0) >= 50
         initial_capture_limit = (
@@ -3721,14 +4012,31 @@ class ShizaiExtensionBridge:
             else:
                 ids = candidate_ids(field, initial_capture_limit)
             selected_by_field[field] = list(dict.fromkeys(ids))
-            for element_id in selected_by_field[field]:
+
+        # Probe one candidate per field before widening any field. A transient
+        # native-channel failure must not consume the whole budget on several
+        # title candidates before price and sales get their first attempt.
+        widest_pool = max((len(values) for values in selected_by_field.values()), default=0)
+        initial_probe_batches: list[list[str]] = []
+        for offset in range(widest_pool):
+            batch: list[str] = []
+            for field in normalized_fields:
+                values = selected_by_field.get(field, [])
+                if offset >= len(values):
+                    continue
+                element_id = values[offset]
                 if element_id and element_id not in selected_ids:
                     selected_ids.append(element_id)
+                    batch.append(element_id)
+            if batch:
+                initial_probe_batches.append(batch)
 
         records_by_id: dict[str, dict[str, Any]] = {}
         capture_errors: list[dict[str, str]] = []
+        capture_transport_failed = False
 
         def capture_ids(ids: Iterable[str]) -> None:
+            nonlocal capture_transport_failed
             for element_id in ids:
                 if element_id in records_by_id:
                     continue
@@ -3740,9 +4048,17 @@ class ShizaiExtensionBridge:
                     )
                     record = captured.get("record")
                     if isinstance(record, dict):
+                        scan_context = candidates_by_id.get(element_id, {}).get("card_context")
+                        if not isinstance(record.get("card_context"), dict) and isinstance(scan_context, dict):
+                            record = dict(record)
+                            record["card_context"] = dict(scan_context)
+                            record["card_context_source"] = "same_snapshot_tree_hint"
                         records_by_id[element_id] = record
                 except Exception as exc:
                     capture_errors.append({"element_id": element_id, "error": str(exc)})
+                    if self._is_transient_capture_error(exc):
+                        capture_transport_failed = True
+                        break
 
         def build_groups(grouping: str) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
             groups: dict[str, dict[str, Any]] = {}
@@ -3761,6 +4077,17 @@ class ShizaiExtensionBridge:
                                 "name": record.get("name", ""),
                                 "rejected": True,
                                 "reason": "selector is a customer-service or navigation link",
+                                "card_context": record.get("card_context"),
+                            }
+                        )
+                        continue
+                    if field == "link" and not link_context.get("is_link"):
+                        values.append(
+                            {
+                                "element_id": element_id,
+                                "name": record.get("name", ""),
+                                "rejected": True,
+                                "reason": "selector is visible text rather than a native anchor element",
                                 "card_context": record.get("card_context"),
                             }
                         )
@@ -3822,16 +4149,30 @@ class ShizaiExtensionBridge:
             return ranked, [item for item in ranked if str(item.get("key") or "") != "__ungrouped__"]
 
         active_grouping = "instance" if card_grouping == "auto" else card_grouping
-        capture_ids(selected_ids)
-        groups, field_candidates = build_groups(active_grouping)
-        ranked_groups, card_groups = rank_groups(groups)
+        groups: dict[str, dict[str, Any]] = {}
+        field_candidates: dict[str, list[dict[str, Any]]] = {}
+        ranked_groups: list[dict[str, Any]] = []
+        card_groups: list[dict[str, Any]] = []
+        for batch in initial_probe_batches:
+            capture_ids(batch)
+            groups, field_candidates = build_groups(active_grouping)
+            ranked_groups, card_groups = rank_groups(groups)
+            if capture_transport_failed:
+                break
+            if any(set(required_fields).issubset(item.get("fields", {})) for item in card_groups):
+                break
         # UIA trees can place a value far away from the title in scan order.
         # Expand the union of gaps in the best few observed cards. Looking at
         # only the first card can miss a title or merchant that is ranked just
         # after the initial window, especially on virtualized result pages.
         expansion_rounds = 0
-        expansion_limit = min(_LIVE_FIELD_EXPANSION_LIMIT, max(candidate_limit, 20))
+        expansion_limit = min(
+            _LIVE_FIELD_EXPANSION_LIMIT,
+            max(initial_capture_limit + 2, candidate_limit),
+        )
         for _ in range(4):
+            if capture_transport_failed:
+                break
             chosen = (card_groups or ranked_groups)[0] if (card_groups or ranked_groups) else None
             chosen_fields = chosen.get("fields", {}) if chosen else {}
             missing_fields = [item for item in required_fields if not chosen_fields.get(item)]
@@ -3894,7 +4235,6 @@ class ShizaiExtensionBridge:
             selection_errors.append("selected page fields do not share a product-card context")
         complete = (
             not missing_fields
-            and not capture_errors
             and not selection_errors
             and (not card_context_required or has_product_card)
         )
@@ -3923,6 +4263,10 @@ class ShizaiExtensionBridge:
             )
         if semantic_warnings:
             quality_warnings.extend(semantic_warnings)
+        if complete and capture_errors:
+            quality_warnings.append(
+                "部分未选用候选的元素详情读取失败；已选中的同卡片字段完整，继续使用本次捕获结果。"
+            )
         pending_recapture_fields = list(
             dict.fromkeys(
                 [*missing_fields]
@@ -3944,19 +4288,36 @@ class ShizaiExtensionBridge:
             "initial_capture_limit": initial_capture_limit,
         }
         recovery_actions: list[dict[str, Any]] = []
-        if "link" in missing_fields:
+        if missing_fields == ["link"] and has_product_card:
+            observed_card_context = next(
+                (context for context in selected_contexts.values() if isinstance(context, dict)),
+                None,
+            )
             recovery_actions.append(
                 {
                     "field": "link",
                     "reason": "当前 DeepCapture 候选没有商品详情 href，客服/页脚链接已被排除。",
                     "tool": "shizai_rpa_add_step",
-                    "component": "WebBrowser_RunJsInIeBySelector_v3",
+                    "component": "Element_SimilarElementList_V2",
+                    "workflow_reference": None,
                     "config_hint": {
-                        "purpose": "在当前 Chrome 页面读取商品卡片的真实详情链接",
-                        "output_variable": "商品链接",
-                        "selector": ".plugin_goodsCardWrapper",
+                        "purpose": "通过原生扩展拾取一个真实商品 anchor，并批量读取绝对链接",
+                        "selector_source": "native_extension_picker",
+                        "target_role": "重复商品卡片中的详情链接 anchor，不是标题文本或卡片容器",
+                        "card_context": observed_card_context,
+                        "config": {
+                            "var0": "商品链接列表",
+                            "var1": "商品链接数量",
+                            "element_position": "default",
+                            "designated_info": 1,
+                            "designated_obj": {"variable": "网页对象"},
+                            "action": "absoluteurl",
+                            "attr_complate": 1,
+                            "start_index": 1,
+                            "end_index": -1,
+                        },
                     },
-                    "next": "重新扫描并使用 JS 输出补充商品链接列，再继续 Excel 写入。",
+                    "next": "先写入原生相似元素组件，再用扩展拾取一个真实详情链接；运行后校验 URL 数量和顺序。",
                 }
             )
         message = (
@@ -4004,6 +4365,7 @@ class ShizaiExtensionBridge:
             "recovery_actions": recovery_actions,
             "selection_errors": selection_errors,
             "capture_errors": capture_errors,
+            "capture_errors_blocking": bool(capture_errors and not complete),
             "ui_feedback": ui_feedback,
             "message": message,
         }

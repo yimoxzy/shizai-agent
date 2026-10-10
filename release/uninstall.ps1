@@ -5,6 +5,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$unregisterBrowser = Join-Path $InstallDir 'scripts\unregister-browser.ps1'
+if ([IO.File]::Exists($unregisterBrowser)) {
+    & $unregisterBrowser -InstallDir $InstallDir | Out-Null
+}
 $unregister = Join-Path $InstallDir 'scripts\unregister-codex.ps1'
 if ([IO.File]::Exists($unregister)) {
     & $unregister | Out-Null

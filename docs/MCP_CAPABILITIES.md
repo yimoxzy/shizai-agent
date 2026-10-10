@@ -1,10 +1,12 @@
 # Shizai Agent MCP 工具目录
 
-版本：`0.7.27`
+版本：`0.7.29`
 
-源码新增可选环境变量 `SHIZAI_MCP_TOOL_PROFILE=rpa-authoring`：29 个原生 RPA 工具，
-默认 `full` 保持 56 个。`shizai_rpa_read_flow` 新增 `detail=edit`、`step_id`；
-`shizai_rpa_update_step` 新增 `dry_run`、`expected_revision`，预览不需要 allow_write。
+源码提供可选环境变量 `SHIZAI_MCP_TOOL_PROFILE=rpa-authoring`：43 个原生 RPA 工具，
+默认 `full` 为 67 个。`shizai_rpa_read_flow` 新增 `detail=edit`、`step_id`；
+`shizai_rpa_update_step` 新增 `dry_run`、`expected_revision`，预览不需要 allow_write；
+`shizai_rpa_remove_step` 按 `expected_revision` 删除主流程步骤，预览不落盘、不驱动原生 UI；
+`shizai_rpa_save_editor` 保存当前活动 editor，并在保存后复核未保存状态和 revision。
 工具集配置、限制和编辑协议见 [中小模型流程设计](SMALL_MODEL_WORKFLOWS.md)。
 
 > 架构基线见 [MCP_ARCHITECTURE.md](MCP_ARCHITECTURE.md)。当前 MCP 的职责是提供实时组件契约并校验结构、参数、元素和安全边界；意图理解、任务拆解、组件组合、循环和分页策略由调用方大模型决定。本文中带有“推荐/规划指导”的字段是建议，不是唯一流程协议。
@@ -45,6 +47,8 @@ MCP 通过 stdio 运行，业务请求连接本机实在设计器。客户端模
 
 红色浏览器遮罩只代表官方交互式元素拾取，不代表识别、设计、校验或运行。普通流程设计使用无红层 DeepCapture 页面树。必须先用 `shizai_rpa_add_step` 写入元素组件，使其进入 `binding_status=unbound`，再按同一 `project_ref + step_id` 扫描或启动拾取；成功、失败、取消和超时都会关闭红层。原生拾取不适用时，客户端模型也可以生成真实 selector，经过校验后绑定到同一组件。
 
+`shizai_rpa_capture_windows`、`shizai_rpa_scan_page`、`shizai_rpa_capture_page_fields` 和 `shizai_rpa_capture_elements` 使用只读 DeepCapture 通道：只更新小卡进度，不播放 5 秒接管倒计时，也不打开接管边框或红色拾取层。返回的 `native_ui.access.mode=capture_read`、`countdown_started=false` 可用于测评和排障。只有打开/改变页面、官方交互式拾取、键鼠操作或运行组件时才进入接管状态。
+
 ## 基础与捕获状态
 
 | 工具 | 用途 | 写入 |
@@ -84,14 +88,31 @@ shizai_generation_context -> shizai_components -> shizai_draft
 
 ## 原生 RPA
 
+### 独立浏览器视觉桥接
+
+| 工具 | 用途 |
+| --- | --- |
+| `shizai_browser_status` / `shizai_browser_tabs` | 检查独立扩展并列出普通网页标签页 |
+| `shizai_browser_activate_tab` | 聚焦目标 Chrome 窗口和标签；截图提示窗口不在前台时调用 |
+| `shizai_browser_capture_viewport` | 返回带 URL、视口和 revision 的 MCP PNG 图片 |
+| `shizai_browser_inspect_points` | 把少量视觉坐标在浏览器本地命中 DOM，并可绑定原生步骤 |
+| `shizai_browser_infer_collection` | 从同一卡片的字段 selector 推断重复行，并可绑定 DataCollectionV5 |
+| `shizai_browser_action` | 在设计证据页执行受限点击、填值或按键；原生调试仍负责最终验证 |
+
+扩展不会把完整 DOM 树发送给模型。模型直接按返回 PNG 的像素坐标取点，扩展会在本地处理高 DPI 缩放；控制元素可传 `prefer_interactive=true` 提升到按钮、链接或输入框。截图变化后必须重新取图；URL、tabId 或 pageRevision 不一致时坐标请求会失败。独立扩展优先用于视觉定位，原客户端 DeepCapture 作为兼容回退。
+
+源码支持多个 MCP 窗口共享 `127.0.0.1:18768`：首个进程持有扩展连接，其它进程经同端口的鉴权 `/mcp` 通道复用。`browser_status.connection_mode` 返回 `owner` 或 `shared`。持有者退出后，下一次调用会重新选出持有者，扩展自行重连；关闭共享调用者不会关闭扩展。
+
+`bridge_in_use` 现在表示端口持有者不支持共享，或安装密钥不一致，应更新/重启旧 MCP 或检查配置。只有缺少配置时才建议安装；桥接已监听、扩展未连接时提示打开 Chrome 并检查扩展启用状态。请求发出后断线/超时返回 `execution_outcome=unknown`，不自动重放点击或输入；先检查当前页面，再决定下一步。页面版本与截图证据仍要按原规则验证，共享连接不代表多个模型可以同时修改同一页面而不冲突。
+
 ### 设计与元素
 
 | 工具 | 用途 |
 | --- | --- |
 | `shizai_rpa_start_design` | 创建客户端原生应用并一次写入已预检的完整组件图；默认不打开浏览器 |
-| `shizai_rpa_open_browser` | 完整图写入后执行意图匹配的导航组件，并启动首次接管倒计时 |
-| `shizai_rpa_capture_windows` | 读取当前 Chrome 窗口 |
-| `shizai_rpa_capture_tree` | 读取有界 UIA/Document 树 |
+| `shizai_rpa_open_browser` | 从已保存导航步骤快速打开真实页面供绑定；不把页面打开误报为原生节点验证成功 |
+| `shizai_rpa_capture_windows` | 紧凑读取当前 Chrome 窗口 ID、标题和扩展就绪摘要 |
+| `shizai_rpa_capture_page_fields` | 在同一页面快照中对齐并绑定结构化采集字段 |
 | `shizai_rpa_scan_page` | 从 Document 扫描语义候选并返回 `scan_token` |
 | `shizai_rpa_capture_elements` | 从同一快照捕获完整 selector，可选直接导入/绑定 |
 | `shizai_rpa_runtime_preflight` | 执行元素组件前检查 Chrome、Document、页面身份、登录和验证页 |
@@ -104,6 +125,8 @@ shizai_generation_context -> shizai_components -> shizai_draft
 | --- | --- |
 | `shizai_rpa_add_step` | 追加一个真实 native 组件，并返回 `step_validation` |
 | `shizai_rpa_update_step` | 更新已有步骤参数并重新校验 |
+| `shizai_rpa_remove_step` | 按 `expected_revision` 删除一个主流程步骤并重新物化；输出变量仍被下游引用时返回 `step_has_dependents` |
+| `shizai_rpa_save_editor` | 按 `expected_revision` 保存当前活动 editor；保存后仍未落盘时返回 `save_unconfirmed`，不谎报成功 |
 | `shizai_rpa_set_step_elements` | 绑定已导入元素 |
 | `shizai_rpa_read_flow` | 回读有序步骤、参数、绑定和下一步 |
 | `shizai_rpa_validate_step` | 单步静态契约校验 |
@@ -116,6 +139,8 @@ shizai_generation_context -> shizai_components -> shizai_draft
 | --- | --- |
 | `shizai_rpa_materialize` | 幂等刷新 RuntimeHost 运行树 |
 | `shizai_rpa_sync_diagnose` | 检查应用/包/task 映射、索引和运行插件 |
+| `shizai_rpa_reload_editor` | MCP 写入后按 revision 刷新当前 editor，并等待活动 editor 连续两次 ready |
+| `shizai_rpa_run_component` | 精确运行一个组件，核对本次生成代码和变量缓存；采集缓存必须新鲜且非空 |
 | `shizai_rpa_run` / `shizai_rpa_status` / `shizai_rpa_stop` | 普通运行、证据检查和停止 |
 | `shizai_rpa_debug_capabilities` | 探测组件断点和会话复用能力 |
 | `shizai_rpa_debug_start` | 启动一次真实 DAP 调试会话 |
@@ -165,7 +190,7 @@ RuntimeHost执行了当前组件；网页组件的预期可见效果仍需模型
 
 | 工具 | 用途 |
 | --- | --- |
-| `shizai_project_list` | 列出本地设计器项目 |
+| `shizai_project_list` | 按名称轻量查找本地设计器项目，默认最多返回 20 条 |
 | `shizai_project_inspect` | 读取项目文件和元数据摘要 |
 | `shizai_project_elements` | 回读元素目录和完整 selector |
 | `shizai_project_import_elements` | 导入已验证元素 |
@@ -204,7 +229,7 @@ route_intent (可选)
 
 ## 中小模型精简返回
 
-`SHIZAI_MCP_TOOL_PROFILE=rpa-authoring` 暴露 29 个工具，目录与创建回执固定使用 compact；
+`SHIZAI_MCP_TOOL_PROFILE=rpa-authoring` 暴露 43 个工具，含组件追加/主流程插入；目录与创建回执固定使用 compact；
 组件契约、步骤校验、项目身份和浏览器恢复信息仍保留。full 集保留 `response_mode=full/compact` 选项。
 精简集完整静态检查通过后的顶层下一步指向 `shizai_rpa_run`，且明确仅在用户要求执行时调用；
 原生 run 内部执行项目诊断，静态检查不替代运行验收。单步调试用于问题定位，不要求先完整调试再重复运行。

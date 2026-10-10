@@ -66,8 +66,18 @@ C:\Users\edy\AppData\Local\Programs\ShizaiAgent\shizai-agent-mcp.exe
 
 ```powershell
 npx -y shizai-agent-mcp@latest install
-npx -y shizai-agent-mcp@latest register codex
+npx -y shizai-agent-mcp@latest status
 ```
+
+从 0.7.29 起，npm 与 MCP 版本号统一。`install` 默认注册 Codex、准备扩展文件并注册
+Native Host；不需要重复安装。`status` 中 `verification.verified` 应为 `true`，
+工具数应为 full=67、rpa-authoring=43。只有旧版本号或配置文件不能证明功能已安装。
+安装前会核对发布清单及文件哈希，升级保留浏览器连接密钥与端口。
+
+首次在 `chrome://extensions` 或 `edge://extensions` 开启开发者模式，加载安装器显示的
+`browser-extension` 目录。原先从临时目录加载的扩展应改为安装目录中的版本；仅注册
+Native Host 不代表浏览器已经加载扩展。需要跳过主机注册时可加 `--without-browser-extension`。
+重新注册 Codex 可单独运行 `npx -y shizai-agent-mcp@latest register codex`。
 
 然后完全退出并重新打开 Codex，在 `/mcp` 中确认：
 
@@ -75,6 +85,8 @@ npx -y shizai-agent-mcp@latest register codex
 2. 服务已连接；
 3. 工具列表包含 `shizai_rpa_analyze_request` 和 `shizai_rpa_component_catalog`；
 4. `Auth: Unsupported` 对本地 stdio MCP 是正常的，不代表工具不可用。
+
+独立浏览器扩展启用后，还应看到 `shizai_browser_status`、`shizai_browser_capture_viewport` 和 `shizai_browser_inspect_points`。`shizai_browser_status` 返回 `ready` 才表示扩展已通过本地 token 握手；仅看到工具名不代表浏览器扩展已连接。
 
 源码开发时可在仓库根目录检查：
 

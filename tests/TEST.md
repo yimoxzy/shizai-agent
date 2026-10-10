@@ -1,5 +1,107 @@
 # Test Plan
 
+## 2026-10-08：桌面胶囊残留收尾修复（源码，未发布）
+
+- 用户指出空闲时仍显示胶囊。发现 validate_step 打开卡片后不关闭，run_component 不收尾，
+  rpa_stop 的原生运行清理只覆盖运行遮罩，遗漏独立小卡；原 cleanup_complete 不能证明胶囊已消失。
+- 已安装 CLI 的 `ui small-card --state hidden --allow-write` 返回 code=0；
+  Computer Use 前后窗口列表确认该小卡窗口从 4 个设计器窗口中消失，主客户端仍在。
+  当时附加 MCP debug_stop 返回 Transport closed，没有把该调用记为清理成功。
+- 新增 tests/test_progress_card_lifecycle.py：17 passed。覆盖成功/异常收尾、上一次预览残留、
+  stop 成功/超时后的全界面清理、拒绝写入不动 UI、关闭失败保留重试状态、连续调试/拾取保留提示。
+- 现有 MCP/小卡/原生 UI 定向回归：66 passed、377 deselected（3.14 秒）；Ruff 和 diff 检查通过。
+- 未修改流程或重跑采集，未升级已安装 MCP；自动收尾需下一发布包验收。
+  回归报告：`_tmp/capsule-lifecycle-regression-20261008.xml`；人工过程步骤 21。
+
+## 2026-10-08：扩展字段身份推断修复与真实原生采集
+
+- 安装版 MCP 0.7.29 / 扩展 0.1.9 已真实连接；原有京东流程的原生采集预览返回 29 行，
+  精确运行 DataCollectionV5 返回本次 59 行四列，代码 ID 与新鲜缓存双重验证通过。
+- 数据回读：无缺列/空字段，3 条整行重复，1 条价格为“待发布”；销量/评价/浏览量保留为热度原文。
+- 修复扩展根据首卡片子节点位置误读广告文案的问题。源码扩展为 0.1.10，逐行核验字段身份；
+  Python 只绑定已核验的 fieldSelector，不再自行删除位置条件。
+- JavaScript 14 passed；Python browser_mcp/browser_bridge/browser_sharing 37 passed（11.37 秒）；
+  发布源码版本检查 1 passed。Ruff、Node 语法、git diff --check 通过。
+- 新覆盖混合卡片布局、广告插入、包装层变化、缺失/重复字段、行外多余命中、危险/丢失字段、
+  纯位置证据、selector 与选点不一致，以及旧响应/不完整逐行证据拒绝绑定。
+- 修复源码未发布、未加载到实际 Chrome；没有把夹具回归计为新版现场成功。
+  现场是人工指导的已有流程验证，不代表 Luna/Qwen、100 行、分页或 Excel 测试通过。
+- 证据：`_tmp/jd-extension-live-20261008/`；完整报告：
+  `docs/MCP_BROWSER_EXTENSION_LIVE_EVALUATION_20261008.md`；人工过程步骤 20。
+
+## 2026-10-08：重启后手工流程与调试任务选择修复（未发布）
+
+- 导航/任务选择定向测试：11 passed、423 deselected（18.89 秒）。
+- 调试与流程编辑回归：83 passed（51.30 秒）；Ruff 与 git diff --check 通过。
+- 新增 7 个场景：调试排除恢复备份并拒绝仅备份的目录；无计划手工流程打开页面；
+  保存 URL 优先于过时计划；变量对象、变量名、非 HTTP URL 和空 URL 不打开浏览器。
+- 现场只读源码诊断确认 `_native_task_file` 和 debug `_native_task` 选择同一根任务、7 步。
+- 实际已安装 0.7.29 MCP 的首组件精确运行成功，代码只包含 ybQEw，缓存为本次更新；
+  此证据不代表以上未发布源码已完成原生调试验收。独立扩展仍 extension_missing。
+- 日志：`_tmp/restart-followup-20261008.txt`、`_tmp/restart-followup-20261008.xml`；
+  人工步骤记录：`docs/HUMAN_GUIDED_NATIVE_COLLECTION_LOG_20260911.md` 步骤 19。
+
+## 2026-10-08：0.7.29 发布与安装完整性
+
+- 最终完整 pytest：655 passed（249.35 秒）；浏览器 JavaScript 7 passed；Ruff、Node 与 PowerShell 语法检查通过。
+- 实际冻结 EXE initialize/tools/list 与源码 schema 完全匹配：full=67、rpa-authoring=43；
+  CLI 版本、Native Host bootstrap、隔离 browser status 与关闭 stderr 均通过。
+- 发布清单核对 17 个最终分发文件；缺失扩展、篡改文件、旧版本、越界路径或漏掉核心工具均拒绝。
+- 真实 npm 首次安装与重复升级使用含中文的隔离目录，保留原连接密钥和端口；没有修改真实注册表。
+- 新增无 curl 的 Windows PowerShell 下载回退测试，覆盖下载、SHA-256、解压、安装核验。
+  另验证 install/uninstall 遇到非本产品目录时拒绝并完整保留用户文件。
+- 本节为协议与安装验收，不代表京东原生采集、Luna/Qwen 业务测试成功。
+- 原始输出：`_tmp/release-0.7.29-final.txt`；JUnit：`_tmp/release-0.7.29-final.xml`；
+  安装记录：`_tmp/install-smoke-0.7.29.txt`。
+
+## 2026-10-08：多进程浏览器桥接与断线恢复
+
+- 最终完整 pytest：641 passed（168.28 秒）；浏览器定向回归 31 passed（7.62 秒），新增 14 项。
+- 同端口鉴权 relay 支持 owner/shared；覆盖双调用方乱序返回、共享调用方退出、持有者退出后接管、
+  2 MB 图片、扩展业务错误保留、错密钥/浏览器 Origin 拒绝、旧进程占用端口提示。
+- 覆盖请求发出后断线/超时不重放、迟到响应不串线、扩展在等待期间连上后执行原请求，
+  以及发现/读取之间持有者退出、发送瞬间连接丢失/超时。未知执行结果明确返回 unknown。
+- 两个真实 stdio MCP 子进程使用受控扩展协议对端完成共享与接管验收，退出 stderr 均为空。
+  该测试没有启动 Chrome 或原生 RPA，不能据此判定网页采集成功。
+- 实际安装配置的独立源码协议检查确认 owner/shared，但真实 Chrome 未运行、扩展未连接；
+  Computer Use 只提供内置浏览器，尝试启动 Chrome 返回 unavailable。现场限制已写入
+  `docs/MCP_QUALITY_REVIEW_20261008.md`，原始状态在 `docs/MCP_BROWSER_SHARING_LIVE_20261008.json`。
+- 安装核验：本机 EXE 标称 0.7.28、实际 full=56 且无 shizai_browser_*；源码 full=67、
+  authoring=42。本轮未发布/替换 EXE。Ruff、compileall、git diff --check 通过。
+- 最终回归原始输出：`_tmp/mcp-quality-20261008.txt`；JUnit：`_tmp/mcp-quality-20261008.xml`。
+
+## 2026-09-21：键盘组件焦点守卫与网页对象校验放宽
+
+- 完整 pytest：627 passed（139.97 秒），新增 10 项回归。
+- 全局键盘组件（`Keyboard_*`）没有元素绑定，改为在预检中校验目标 Chrome 窗口的前台焦点：
+  新增 `_foreground_window_id`、`_activate_window`、`check_chrome_window_focus`；焦点无法确认时
+  返回 `window_focus_unverified`（下一步 `debug_capabilities`），目标窗口无法识别时返回
+  `target_window_unknown`（下一步 `scan_page`，且不枚举窗口），两种情况都不发送调试 `continue`。
+  5 项覆盖未知目标不枚举、前台命中、激活后确认、激活被拒和 Chrome 缺失。
+- 静态校验放宽两处误报：页面组件接受上游浏览器节点自身的输出变量、计划 `outputs` 与固定默认
+  `网页对象`；计划 `outputs` 少于组件实际写入槽位时，只要多出的槽位是该组件的固定原生输出就通过。
+  未知对象名和真正的多余槽位仍失败，并写入 `accepted names` 与 `surplus native slots` 明细。
+- 工具数 66→67（full）、41→42（rpa-authoring）；声明字符数 full 45,894（预算 46,600）、
+  rpa-authoring 30,001（预算 30,600，为 full 的 65.4%）。`shizai_rpa_save_editor` 与未保存门禁
+  在上一个提交落地，本次补齐 `tests/TEST.md` 契约条目和 `RPA_AUTHORING_INSTRUCTIONS` 的保存说明。
+- `scripts/probe_collection_selector_variants.py` 不再硬编码个人工作区路径，改为必需的位置参数；
+  `tests/test_browser_bridge.py` 的既存 I001 已修复。Ruff、compileall 通过。
+
+## 2026-09-20：MCP 主流程步骤删除（remove_step）
+
+- 完整 pytest：614 passed（142.06 秒）。新增 6 项 `remove_step` 回归：只读预览（不落盘、
+  不驱动原生 UI，且以 `publish_ui=False` 调用真实校验器）、revision 冲突与依赖拒绝
+  （`step_has_dependents` 返回下游步骤和改绑提示）、未知/嵌套/主容器/最后一步的目标拒绝、
+  真实删除并同步 statements/实体/计划与 `mcpUseJs*` 标记、仍有其它 JS 节点时保留标记、
+  MCP 写入门禁与 CLI/MCP 预览等价。
+- 只读预览不再产生 UI 副作用：`validate_rpa_project` 与 `validate_rpa_flow` 新增
+  `publish_ui` 关键字参数，默认 `True` 保持所有写入路径行为不变。
+- 工具数 65→66（full）、40→41（rpa-authoring）；声明字符数 full 45,751（预算 46,000）、
+  rpa-authoring 29,603（预算 30,000，且低于 full 的 67%）。压缩的是冗长说明，没有放宽预算。
+- Ruff（改动文件）、compileall、全部 114 个 CLI 帮助入口通过。仓库中另有 2 处既存
+  `I001` 导入排序问题（`scripts/probe_collection_selector_variants.py`、
+  `tests/test_browser_bridge.py`），与本次改动无关。
+
 ## 2026-09-09：Luna 实测后的 MCP 修复
 
 - 完整 pytest：418 passed（122.45 秒）。新增 17 项实测问题回归，覆盖只读预检、目录与创建精简返回、
@@ -33,16 +135,32 @@
 
 ## Contract Checks
 
-- The default MCP profile exposes exactly 56 uniquely named tools; the optional
-  rpa-authoring profile exposes 29 and rejects calls to unadvertised tools.
+- The default MCP profile exposes exactly 67 uniquely named tools; the optional
+  rpa-authoring profile exposes 42 and rejects calls to unadvertised tools.
 - Every public schema rejects unknown fields and has a matching dispatcher branch.
-- Full tool definitions stay below 39,000 characters; rpa-authoring stays below
-  25,000 characters and 65% of the full profile. Full server instructions stay
+- Full tool definitions stay below 46,600 characters; rpa-authoring stays below
+  30,600 characters and 67% of the full profile. Full server instructions stay
   below 2,100 characters. Character counts are not model token measurements.
 - Read operations redact credential-shaped values.
 - Every mutating operation requires `allow_write=true`.
 - Native parameter preview uses `dry_run=true` without write permission. It
   performs parameter encoding only, never claiming static or runtime validation.
+- Native step removal is revision-driven and refuses a step whose output variable
+  is still read downstream unless `allow_dependents=true`; its preview performs no
+  persistence and no designer UI.
+- Saving the active editor is revision-driven and re-reads the dirty flag,
+  revision and step list afterwards; a still-dirty editor returns
+  `save_unconfirmed` instead of reporting success.
+- A full run or a debug start returns `editor_unsaved_changes` while the active
+  editor has unsaved changes; an absent editor does not block.
+- Global keyboard components (`Keyboard_*`) verify the target Chrome window's
+  foreground focus instead of an element binding. An unconfirmed focus returns
+  `window_focus_unverified` and an unidentifiable target returns
+  `target_window_unknown`; neither sends a debug `continue`.
+- Page components accept the upstream browser node's own output variable, the
+  planned output names and the canonical `网页对象` default, and a plan may name
+  fewer outputs than the component writes only when the surplus slots are that
+  component's canonical outputs.
 - Flow validation runs before apply, execution, or debugger commands.
 - Agent guidance references only tools present in the current MCP catalog.
 - Small-card lifecycle tests verify one window open, renderer-only state updates,

@@ -25,11 +25,17 @@ release/package/
 
 # Local release history and probe artifacts are recoverable but never source.
 archive/
+artifacts/
 mcp-release/
 mcp-*.spec
 _tmp_mcp_*.py
 _tmp_verify_*.py
 jd_phone_products.xlsx
+jd-search-*.png
+debug-stop-sync.json
+native-collection-probe-result.json
+two-component-step-probe*.json
+.zcode/
 release/*/
 !release/scripts/
 !release/scripts/**

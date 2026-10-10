@@ -202,6 +202,24 @@ class TransientStackTimeoutDebugClient(FakeDebugClient):
         return super().call_unlocked(service, method, args)
 
 
+class TerminalAfterContinueDebugClient(FakeDebugClient):
+    """Model the adapter dropping its thread after flow-tail continuation."""
+
+    def __init__(self, line_count: int = 1):
+        super().__init__(line_count=line_count)
+        self.terminal = False
+
+    def call_unlocked(self, service, method, args):
+        if service == "DebugAdapterService" and method == "send":
+            command = args[0]
+            if command == "continue":
+                self.terminal = True
+            if command == "threads" and self.terminal:
+                self.calls.append((service, method, args))
+                return {"body": {"threads": []}}
+        return super().call_unlocked(service, method, args)
+
+
 def _paths(tmp_path):
     return ShizaiPaths(
         data_root=tmp_path,
@@ -237,9 +255,52 @@ def _project(tmp_path):
     return root
 
 
-def test_native_debug_reuses_designer_dap_session_without_starting_another_runtime(tmp_path):
+def test_debug_selects_live_task_instead_of_restore_backup(tmp_path):
+    project = _project(tmp_path)
+    backup = project / ".sz" / "draft-restore-backup" / "snapshot" / "io5cd.task"
+    backup.parent.mkdir(parents=True)
+    payload = json.loads((project / "io5cd.task").read_text())
+    payload["componentModelEntities"]["MAIN_COMPONENT"]["args0"][0]["value"].append("removed-step")
+    backup.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = debug_session.debug_capabilities(_paths(tmp_path), str(project))
+    assert result["task"]["path"] == str(project / "io5cd.task")
+    assert result["component_count"] == 3
+    (project / "io5cd.task").unlink()
+    with pytest.raises(FileNotFoundError):
+        debug_session.debug_capabilities(_paths(tmp_path), str(project))
+
+
+def test_debug_flow_frame_rejects_same_module_from_another_project(tmp_path):
     paths = _paths(tmp_path)
     project = _project(tmp_path)
+    other_project = tmp_path / "applications" / "old-flow"
+    other_module = other_project / "projects" / "flow_modules" / "io5cd.py"
+    session = debug_session.NativeDebugSession(
+        paths=paths,
+        project_dir=project,
+        task_path=project / "io5cd.task",
+        arrangement_id="io5cd-flowBlock",
+        component_ids=["open", "input", "collect"],
+        start_from=1,
+        client=FakeDebugClient(),
+        state_file=tmp_path / "session.json",
+    )
+
+    current_module = project / "projects" / "flow_modules" / "io5cd.py"
+    assert session._is_flow_frame({"source": {"path": str(current_module)}}) is True
+    assert session._is_flow_frame({"source": {"path": str(other_module)}}) is False
+    assert session._is_flow_frame({"source": {"path": "C:/flow_modules/io5cd.py"}}) is True
+
+
+def test_native_debug_reuses_designer_dap_session_without_starting_another_runtime(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    project = _project(tmp_path)
+    monkeypatch.setattr(
+        debug_session,
+        "runtime_preflight",
+        lambda *args, **kwargs: {"valid": True, "reason": "not_applicable"},
+    )
     (paths.data_root / "debugpyPort.json").write_text(json.dumps({"Port": 65432}), encoding="utf-8")
     client = FakeDebugClient(line_count=3)
     client.line = 2
@@ -427,9 +488,14 @@ def test_native_debug_next_ignores_intermediate_flow_lines_until_exact_component
     assert len(dap_steps) == 3
 
 
-def test_native_debug_next_completes_last_component_at_flow_tail_without_extra_step(tmp_path):
+def test_native_debug_next_finishes_flow_tail_after_last_component(tmp_path, monkeypatch):
     paths = _paths(tmp_path)
     project = _project(tmp_path)
+    monkeypatch.setattr(
+        debug_session,
+        "runtime_preflight",
+        lambda *args, **kwargs: {"valid": True, "reason": "not_applicable"},
+    )
     module = project / "projects" / "flow_modules" / "io5cd.py"
     module.write_text(
         'WebBrowser.CreateV3(_position=("io5cd", "open", "流程块1", "打开网页", "1", "WebBrowser.CreateV3"))\n'
@@ -439,7 +505,7 @@ def test_native_debug_next_completes_last_component_at_flow_tail_without_extra_s
         "    pass\n",
         encoding="utf-8",
     )
-    client = FakeDebugClient(line_count=5)
+    client = TerminalAfterContinueDebugClient(line_count=5)
     client.line = 3
     session = debug_session.NativeDebugSession(
         paths=paths,
@@ -453,18 +519,28 @@ def test_native_debug_next_completes_last_component_at_flow_tail_without_extra_s
         thread_id=7,
         status="paused",
         current={"component_id": "collect", "component_sequence": 3, "component_boundary": True},
+        adapter_mode="designer_reused",
         last_line=3,
+    )
+    monkeypatch.setattr(debug_session, "ShizaiDesktopAgent", TerminalAfterContinueDebugClient)
+    monkeypatch.setattr(
+        debug_session,
+        "call_active_editor_renderer",
+        lambda _client, _service, method, _args=None, **_kwargs: (
+            "terminaled" if method == "getDebugState" else False
+        ),
     )
 
     result = session.command("next", wait_seconds=1)
 
-    assert result["status"] == "paused"
-    assert result["current"]["line"] == 4
+    assert result["status"] == "succeeded"
     assert result["component_completed"] is True
     assert result["completed_component_id"] == "collect"
-    assert result["flow_tail_pending"] is True
-    dap_steps = [item for item in client.calls if item[:2] == ("DebugAdapterService", "send") and item[2][0] == "next"]
-    assert len(dap_steps) == 1
+    assert result.get("flow_tail_pending", False) is False
+    dap_commands = [
+        item[2][0] for item in client.calls if item[:2] == ("DebugAdapterService", "send")
+    ]
+    assert dap_commands == ["setBreakpoints", "continue"]
 
 
 def test_native_debug_continue_freezes_runtime_error_after_dap_disconnect(tmp_path):
@@ -524,6 +600,118 @@ def test_native_debug_preflight_blocks_element_execution_without_sending_continu
     assert not any(item[:2] == ("DebugAdapterService", "send") and item[2][0] == "continue" for item in client.calls)
 
 
+def test_runtime_preflight_rejects_unbound_element_component(tmp_path):
+    paths = _paths(tmp_path)
+    project = _project(tmp_path)
+
+    result = debug_session.runtime_preflight(paths, str(project), step_id="input", client=FakeDebugClient())
+
+    assert result["valid"] is False
+    assert result["reason"] == "element_binding_missing"
+    assert result["component"] == "Element_SetValue_V6"
+    assert result["next_action"]["tool"] == "shizai_rpa_scan_page"
+
+
+def _keyboard_project(tmp_path):
+    """Add a global keyboard step that inherits its page identity from a bound element."""
+    root = _project(tmp_path)
+    task = json.loads((root / "io5cd.task").read_text(encoding="utf-8"))
+    entities = task["componentModelEntities"]
+    entities["MAIN_COMPONENT"]["args0"] = [{"name": "statements", "value": ["open", "input", "press"]}]
+    entities["input"]["mcpElementIds"] = ["field-a"]
+    entities["press"] = {
+        "id": "press", "type": "Keyboard_PressNew", "label": "回车搜索",
+        "args0": [{"name": "key", "value": "13"}],
+    }
+    (root / "io5cd.task").write_text(json.dumps(task), encoding="utf-8")
+    (root / "elements.json").write_text(
+        json.dumps({"elementMap": {"field-a": {
+            "page_title": "商品搜索 - 京东", "page_url": "https://search.test/results",
+        }}}),
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_keyboard_component_preflight_blocks_unverified_focus_without_sending_continue(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    project = _keyboard_project(tmp_path)
+    client = FakeDebugClient(line_count=3)
+    forwarded = {}
+
+    def fake_focus(**kwargs):
+        forwarded.update(kwargs)
+        return {
+            "focused": False, "reason": "window_focus_unverified", "hwnd": 11,
+            "title": "商品搜索 - 京东", "activated": False,
+            "foreground_hwnd": 0, "foreground_title": "",
+        }
+
+    monkeypatch.setattr(debug_session, "check_chrome_window_focus", fake_focus)
+    session = debug_session.NativeDebugSession(
+        paths=paths,
+        project_dir=project,
+        task_path=project / "io5cd.task",
+        arrangement_id="io5cd-flowBlock",
+        component_ids=["open", "input", "press"],
+        start_from=1,
+        client=client,
+        state_file=tmp_path / "session.json",
+        thread_id=7,
+        status="paused",
+        current={"component_id": "press", "component_sequence": 3},
+        last_line=3,
+    )
+
+    result = session.command("next", wait_seconds=0.2)
+
+    assert result["status"] == "paused"
+    assert result["preflight_blocked"] is True
+    assert result["preflight"]["reason"] == "window_focus_unverified"
+    assert forwarded["expected_title"] == "商品搜索 - 京东"
+    assert forwarded["activate"] is True
+    assert not any(item[:2] == ("DebugAdapterService", "send") and item[2][0] == "continue" for item in client.calls)
+
+
+def test_keyboard_component_preflight_passes_when_window_is_focused(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    project = _keyboard_project(tmp_path)
+    monkeypatch.setattr(
+        debug_session,
+        "check_chrome_window_focus",
+        lambda **kwargs: {
+            "focused": True, "reason": "focused", "hwnd": 11, "title": "商品搜索 - 京东",
+            "activated": False, "foreground_hwnd": 11, "foreground_title": "商品搜索 - 京东",
+        },
+    )
+
+    result = debug_session.runtime_preflight(paths, str(project), step_id="press", client=FakeDebugClient())
+
+    assert result["valid"] is True
+    assert result["reason"] == "window_focused"
+    assert result["component"] == "Keyboard_PressNew"
+    assert result["window_focus"]["focused"] is True
+
+
+def test_keyboard_component_preflight_blocks_unknown_target_window(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    project = _keyboard_project(tmp_path)
+    monkeypatch.setattr(
+        debug_session,
+        "check_chrome_window_focus",
+        lambda **kwargs: {
+            "focused": False, "reason": "target_window_unknown", "hwnd": 0, "title": "",
+            "activated": False, "foreground_hwnd": 0, "foreground_title": "",
+        },
+    )
+
+    result = debug_session.runtime_preflight(paths, str(project), step_id="press", client=FakeDebugClient())
+
+    assert result["valid"] is False
+    assert result["reason"] == "target_window_unknown"
+    assert result["next_action"]["tool"] == "shizai_rpa_scan_page"
+
+
 def test_native_debug_capabilities_reports_component_breakpoint_and_reuse_contract(tmp_path):
     paths = _paths(tmp_path)
     project = _project(tmp_path)
@@ -534,8 +722,28 @@ def test_native_debug_capabilities_reports_component_breakpoint_and_reuse_contra
     assert result["component_count"] == 3
     assert result["generated_position_count"] == 3
     assert result["active_session"] is False
+    assert result["cleanup_required"] is False
     assert result["capabilities"]["component_next"]["supported"] is True
     assert result["capabilities"]["browser_session_reuse"]["supported"] is True
+
+
+def test_native_debug_capabilities_reports_failed_owned_run_needs_cleanup(tmp_path):
+    paths = _paths(tmp_path)
+    project = _project(tmp_path)
+    state_file = debug_session._state_path(paths, project)
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(
+        json.dumps({"status": "runtime_error", "run_owned": True, "project": str(project)}),
+        encoding="utf-8",
+    )
+
+    result = debug_session.debug_capabilities(paths, str(project))
+
+    assert result["active_session"] is False
+    assert result["session_status"] == "runtime_error"
+    assert result["run_owned"] is True
+    assert result["cleanup_required"] is True
+    assert result["next_action"]["tool"] == "shizai_rpa_debug_stop"
 
 
 def test_native_debug_creates_dap_session_when_designer_has_none(tmp_path):
@@ -571,6 +779,10 @@ def test_native_debug_creates_dap_session_when_designer_has_none(tmp_path):
     assert "class RPAProject" in run_request["code"]
     assert any(item[:2] == ("DebugAdapterService", "connect") for item in client.calls)
     assert any(item[:2] == ("DebugAdapterService", "send") and item[2][0] == "attach" for item in client.calls)
+    assert not any(
+        item[:2] == ("DebugAdapterService", "send") and item[2][0] == "configurationDone"
+        for item in client.calls
+    )
 
     debug_session.debug_stop(paths, str(project))
     assert any(item[:2] == ("AppRunService", "stop") for item in client.calls)
@@ -623,6 +835,10 @@ def test_native_debug_waits_for_designer_attach_after_runtime_start(tmp_path):
     assert result["adapter_mode"] == "designer_reused"
     assert result["dap_session_reused"] is True
     assert not any(item[:2] == ("DebugAdapterService", "connect") for item in client.calls)
+    assert not any(
+        item[:2] == ("DebugAdapterService", "send") and item[2][0] == "configurationDone"
+        for item in client.calls
+    )
     debug_session.debug_stop(paths, str(project))
 
 
@@ -649,6 +865,7 @@ def test_native_debug_configures_dap_while_attach_is_pending(tmp_path):
 
     assert result["status"] == "paused"
     assert client.events.index("configuration_done") < client.events.index("attach_finished")
+    assert client.events.count("configuration_done") == 1
     assert result["run_owned"] is True
     debug_session.debug_stop(paths, str(project))
 
@@ -716,6 +933,7 @@ def test_native_debug_stop_treats_app_run_3001_as_already_stopped(tmp_path):
     assert result["stop_attempted"] is True
     assert result["stop_acknowledged"] is True
     assert result["disconnect_attempted"] is True
+    assert result["run_owned"] is False
     stop_index = next(index for index, item in enumerate(client.calls) if item[:2] == ("AppRunService", "stop"))
     disconnect_index = next(
         index
@@ -724,6 +942,77 @@ def test_native_debug_stop_treats_app_run_3001_as_already_stopped(tmp_path):
     )
     assert stop_index < disconnect_index
     assert any(item[:2] == ("AppRunService", "stop") for item in client.calls)
+
+
+def test_native_debug_stop_disconnects_failed_designer_takeover(tmp_path):
+    paths = _paths(tmp_path)
+    project = _project(tmp_path)
+    client = FakeDebugClient(line_count=3)
+    session = debug_session.NativeDebugSession(
+        paths=paths,
+        project_dir=project,
+        task_path=project / "io5cd.task",
+        arrangement_id="io5cd-flowBlock",
+        component_ids=["open", "input", "collect"],
+        start_from=1,
+        client=client,
+        state_file=tmp_path / "session.json",
+        thread_id=7,
+        status="runtime_error",
+        adapter_mode="designer_reused",
+        run_owned=False,
+    )
+
+    result = session.stop()
+
+    assert result["stopped"] is True
+    assert result["disconnect_attempted"] is True
+    assert result["stop_attempted"] is False
+    assert any(
+        item[:2] == ("DebugAdapterService", "send") and item[2][0] == "disconnect" for item in client.calls
+    )
+
+
+def test_native_debug_stop_uses_editor_controller_for_reused_designer_session(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    project = _project(tmp_path)
+    client = FakeDebugClient(line_count=2)
+    monkeypatch.setattr(
+        debug_session,
+        "_stop_designer_debug_controller",
+        lambda _client, _arrangement_id=None: {
+            "handled": True,
+            "debugging_before": True,
+            "debugging_after": False,
+            "stop_requested": True,
+        },
+    )
+    session = debug_session.NativeDebugSession(
+        paths=paths,
+        project_dir=project,
+        task_path=project / "io5cd.task",
+        arrangement_id="io5cd-flowBlock",
+        component_ids=["open", "calculate"],
+        start_from=1,
+        client=client,
+        state_file=tmp_path / "session.json",
+        thread_id=7,
+        status="paused",
+        adapter_mode="designer_reused",
+        run_owned=True,
+    )
+
+    result = session.stop()
+
+    assert result["cleanup_complete"] is True
+    assert result["stop_attempted"] is True
+    assert result["stop_acknowledged"] is True
+    assert result["disconnect_attempted"] is False
+    assert result["designer_stop"]["debugging_after"] is False
+    assert not any(item[:2] == ("AppRunService", "stop") for item in client.calls)
+    assert not any(
+        item[:2] == ("DebugAdapterService", "send") and item[2][0] == "disconnect" for item in client.calls
+    )
 
 
 def test_native_debug_stop_persists_cleanup_timeout_and_retry_action(tmp_path):
@@ -792,6 +1081,7 @@ def test_native_debug_stop_persists_terminal_state_after_cross_process_fallback(
     assert result["cleanup_complete"] is True
     assert persisted["status"] == "stopped"
     assert persisted["cleanup_status"] == "complete"
+    assert persisted["run_owned"] is False
 
 
 def test_native_debug_skips_stale_adapter_after_terminal_persisted_session(tmp_path):
@@ -847,6 +1137,115 @@ def test_native_debug_does_not_report_component_implementation_frame_as_paused(t
     assert result["status"] == "running"
     assert result["current"] is None
     assert "组件实现内部" in result["message"]
+
+
+def test_designer_reused_next_observes_designer_cached_boundary_without_dap_snapshot(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    project = _project(tmp_path)
+    client = FakeDebugClient(line_count=3)
+    session = debug_session.NativeDebugSession(
+        paths=paths,
+        project_dir=project,
+        task_path=project / "io5cd.task",
+        arrangement_id="io5cd-flowBlock",
+        component_ids=["open", "input", "collect"],
+        start_from=1,
+        client=client,
+        state_file=tmp_path / "session.json",
+        thread_id=7,
+        status="paused",
+        current={"component_id": "open", "component_sequence": 1, "component_boundary": True},
+        adapter_mode="designer_reused",
+        last_line=1,
+    )
+
+    def renderer_call(_client, service, method, args=None, **_kwargs):
+        if service == "DebugStackFrameService" and method == "dispose":
+            return None
+        if service == "DebugStackFrameService" and method == "getCurrentStackFrame":
+            return {
+                "id": 2,
+                "name": "main",
+                "line": 2,
+                "column": 1,
+                "source": {"path": str(project / "projects" / "flow_modules" / "io5cd.py")},
+            }
+        if service == "DebugControllerService" and method == "getDebugState":
+            return "stopped"
+        raise AssertionError((service, method))
+
+    monkeypatch.setattr(debug_session, "call_active_editor_renderer", renderer_call)
+    monkeypatch.setattr(debug_session, "ShizaiDesktopAgent", FakeDebugClient)
+    monkeypatch.setattr(
+        debug_session,
+        "runtime_preflight",
+        lambda *args, **kwargs: {"valid": True, "reason": "not_applicable"},
+    )
+
+    result = session.command("next", wait_seconds=1)
+
+    assert result["status"] == "paused"
+    assert result["completed_component_id"] == "open"
+    assert result["current"]["component_id"] == "input"
+    assert result["runtime_verification"]["evidence_kind"] == "dap_next_component_breakpoint"
+    dap_commands = [
+        item[2][0] for item in client.calls if item[:2] == ("DebugAdapterService", "send")
+    ]
+    assert dap_commands == ["setBreakpoints", "continue"]
+
+
+def test_designer_reused_last_component_finishes_without_dap_snapshot_timeout(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    project = _project(tmp_path)
+    client = FakeDebugClient(line_count=3)
+    session = debug_session.NativeDebugSession(
+        paths=paths,
+        project_dir=project,
+        task_path=project / "io5cd.task",
+        arrangement_id="io5cd-flowBlock",
+        component_ids=["open", "input", "collect"],
+        start_from=1,
+        client=client,
+        state_file=tmp_path / "session.json",
+        thread_id=7,
+        status="paused",
+        current={"component_id": "collect", "component_sequence": 3, "component_boundary": True},
+        adapter_mode="designer_reused",
+        run_owned=True,
+        last_line=3,
+    )
+
+    def renderer_call(_client, service, method, args=None, **_kwargs):
+        if service == "DebugStackFrameService" and method == "dispose":
+            return None
+        if service == "DebugControllerService" and method == "getDebugState":
+            return "terminaled"
+        if service == "DebugControllerService" and method == "getIsDebugging":
+            return False
+        raise AssertionError((service, method))
+
+    monkeypatch.setattr(debug_session, "call_active_editor_renderer", renderer_call)
+    monkeypatch.setattr(debug_session, "ShizaiDesktopAgent", FakeDebugClient)
+    monkeypatch.setattr(session, "_runtime_error_from_logs", lambda: None)
+    monkeypatch.setattr(
+        debug_session,
+        "runtime_preflight",
+        lambda *args, **kwargs: {"valid": True, "reason": "not_applicable"},
+    )
+
+    started = time.monotonic()
+    result = session.command("next", wait_seconds=30)
+
+    assert time.monotonic() - started < 1
+    assert result["status"] == "succeeded"
+    assert result["component_completed"] is True
+    assert result["completed_component_id"] == "collect"
+    assert result["runtime_verification"]["evidence_kind"] == "designer_terminal_state"
+    assert result["run_owned"] is False
+    dap_commands = [
+        item[2][0] for item in client.calls if item[:2] == ("DebugAdapterService", "send")
+    ]
+    assert dap_commands == ["setBreakpoints", "continue"]
 
 
 def test_native_debug_adapter_identity_rejects_old_listener_and_accepts_new_listener(tmp_path):

@@ -5,11 +5,44 @@ import os
 
 import pytest
 
+from scripts import luna_rpa_eval
 from scripts.grade_luna_rpa import inspect_artifact
 from scripts.luna_rpa_eval import snapshot_flows, snapshot_outputs
 from shizai_agent.core import component_catalog, mcp_server, project
 from shizai_agent.core.paths import ShizaiPaths
 from shizai_agent.core.workflow_responses import authoring_result
+
+
+def test_eval_runner_disables_dynamic_mcp_with_complete_transport(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = json.dumps({
+            "transport": {
+                "type": "stdio",
+                "command": "node.exe",
+                "args": ["launch.mjs"],
+                "cwd": "C:/runtime",
+            },
+        })
+
+    monkeypatch.setattr(luna_rpa_eval.subprocess, "run", lambda *args, **kwargs: Result())
+
+    assert luna_rpa_eval.disabled_mcp_overrides("codex.exe", "cua_repl") == {
+        "mcp_servers.cua_repl.command": "node.exe",
+        "mcp_servers.cua_repl.args": ["launch.mjs"],
+        "mcp_servers.cua_repl.cwd": "C:/runtime",
+        "mcp_servers.cua_repl.enabled": False,
+    }
+
+
+def test_eval_runner_skips_missing_dynamic_mcp_override(monkeypatch):
+    class Result:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(luna_rpa_eval.subprocess, "run", lambda *args, **kwargs: Result())
+
+    assert luna_rpa_eval.disabled_mcp_overrides("codex.exe", "missing") == {}
 
 
 def test_exact_contract_lookup_exposes_live_family_variants_without_substitution(tmp_path):

@@ -102,7 +102,7 @@ shizai-agent --json workflow rpa-component-catalog --scope business --business-p
 1. 先调用 `shizai_auth_status`，确认设计器已启动并登录。
 2. 只调用一次 `shizai_rpa_analyze_request`，原样保留 query 和 analysis_id。
 3. 使用分析返回的 `recommended_catalog_query` 做一次 `capability_mode=any + detail=contract` 查询。
-4. 参考 `component_requirements` 选择能覆盖目标的组件组合；如果有已安装、可物化且能力匹配的原生组件，先评估它，结构化网页采集优先评估 `WebBrowser_DataCollectionV5`。N 条多页采集可以选择一个内置分页组件，也可以拆成采集、翻页、循环和输出等多个组件。
+4. 参考 `component_requirements` 选择能覆盖目标的组件组合；如果有已安装、可物化且能力匹配的原生组件，先评估它，结构化网页采集优先评估 `WebBrowser_DataCollectionV5`。N 条多页采集可以选择一个内置分页组件，也可以拆成采集、翻页、循环和输出等多个组件。分析结果若声明 `collection.shape=hierarchical`，按 `parent_collection`、`child_collection`、`record_alignment` 分阶段设计，两个采集节点使用不同输出目标并保留父子对齐键；MCP native-first 预检会在阶段不完整时阻止写入。
 5. 把候选的 `planning_patterns` 当作语义 config 示例；不要复制 `defaultValue` 中的 native 引号编码，也不要把示例当成固定步骤。
 6. 业务组件先检查 `availability`、`package_cache_available`、`project_imported` 和 `requires_import`；`catalog_only` 只能作为能力参考，不能直接写入项目。
 7. 只有选定组件后才读取 `detail=full`，避免把完整 UI 配置大量放入上下文。

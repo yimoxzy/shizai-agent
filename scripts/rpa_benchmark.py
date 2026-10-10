@@ -181,6 +181,42 @@ def flow_evidence(turn, project, report_dir):
     return {}, []
 
 
+def native_flow_contract(nodes, spec):
+    """Check component-specific benchmark expectations against a task snapshot."""
+    contract = spec.get("native_flow") if isinstance(spec.get("native_flow"), dict) else {}
+    component_types = {str(node.get("type") or "") for node in nodes.values() if isinstance(node, dict)}
+    required = {str(item) for item in contract.get("required_components", []) if str(item)}
+    if not required.issubset(component_types):
+        return False
+    if not contract.get("forbid_table_href"):
+        return True
+    for node in nodes.values():
+        if not isinstance(node, dict) or node.get("type") != "WebBrowser_DataCollectionV5":
+            continue
+        arguments = {str(item.get("name")): item.get("value") for item in node.get("args0", [])
+                     if isinstance(item, dict) and item.get("name")}
+        config = arguments.get("config")
+        try:
+            config = json.loads(config) if isinstance(config, str) else config
+        except (json.JSONDecodeError, TypeError):
+            return False
+        collection = config.get("collectionConfig") if isinstance(config, dict) else None
+        if not isinstance(collection, dict):
+            return False
+        columns = collection.get("columnConfigArray")
+        if not isinstance(columns, list):
+            return False
+        if not collection.get("tableSelector"):
+            continue
+        if any(
+            isinstance(column, dict)
+            and str(column.get("dataAttrName") or "").casefold() == "href"
+            for column in columns
+        ):
+            return False
+    return True
+
+
 def grade(manifest_path, report_path, review_path=None):
     manifest_path, report_path = Path(manifest_path).resolve(), Path(report_path).resolve()
     manifest, report = read(manifest_path), read(report_path)
@@ -211,7 +247,8 @@ def grade(manifest_path, report_path, review_path=None):
         script_nodes = [k for k, n in nodes.items() if re.search(r"runjs|python|script|executecode", n.get("type", ""), re.I)]
         checks = {"bound_prompt": binding and turn.get("prompt") == prompts[index], "turn_completed": turn.get("status") == "completed",
                   "runtime_success": payload.get("terminal_status") == "success", "native_task_present": bool(nodes),
-                  "artifact_correct": valid_file, "same_app_and_required_graph": bool(same_graph)}
+                  "artifact_correct": valid_file, "same_app_and_required_graph": bool(same_graph),
+                  "native_flow_contract": native_flow_contract(nodes, case)}
         records.append({"index": index + 1, "checks": checks, "seconds": turn.get("elapsed_seconds"), "tool_calls": len(calls),
                         "catalog_calls": len(queries), "repeated_catalog_calls": len(queries) - len(set(queries)),
                         "created_apps": sum(bool((tool_payload(i).get("application") or {}).get("created")) for i in calls if i.get("tool") == "shizai_rpa_start_design"),

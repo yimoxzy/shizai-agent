@@ -253,6 +253,87 @@
       "manual_review_required": true
     },
     {
+      "id": "web-native-card-link",
+      "group": "web",
+      "title": "卡片页原生链接采集",
+      "environment": "fixture",
+      "facts": {
+        "resource": "product_listing",
+        "operation": "collect"
+      },
+      "capabilities": [
+        "navigate",
+        "input",
+        "extract",
+        "output",
+        "native_collection",
+        "link_attribute"
+      ],
+      "turns": [
+        {
+          "request": "打开 {entry}，查询“耳机”，优先使用实时原生数据采集组件采集商品编号、商品名称、价格、销量原文、销量口径、商品链接；商品链接必须是真实 URL，不能输出“查看商品”等链接文字，保存为 UTF-8 CSV 到 {output}。",
+          "oracle": "shop:耳机",
+          "budget_seconds": 240,
+          "budget_calls": 24
+        },
+        {
+          "request": "同一个流程只改成查询“相机”，保留原生采集组件、字段、列顺序和真实 URL 验收，输出到同一个文件。",
+          "oracle": "shop:相机",
+          "budget_seconds": 120,
+          "budget_calls": 12
+        }
+      ],
+      "extension": ".csv",
+      "edit_mode": "parameters",
+      "entry": "/shop?layout=cards",
+      "native_flow": {
+        "required_components": [
+          "WebBrowser_DataCollectionV5"
+        ],
+        "forbid_table_href": true
+      },
+      "manual_review_required": true
+    },
+    {
+      "id": "web-nested-table-link-fallback",
+      "group": "web",
+      "title": "表格内嵌链接能力降级",
+      "environment": "fixture",
+      "facts": {
+        "resource": "product_listing",
+        "operation": "collect"
+      },
+      "capabilities": [
+        "navigate",
+        "input",
+        "extract",
+        "output",
+        "capability_fallback",
+        "link_attribute"
+      ],
+      "turns": [
+        {
+          "request": "打开 {entry}，查询“耳机”，采集商品编号、商品名称、价格、销量原文、销量口径、商品链接。先评估并实跑原生采集组件；若表格模式只能读取单元格内的链接文字，必须改用可执行的通用降级方案，不能反复重试同类 selector，也不能把“查看商品”冒充 URL。保存为 UTF-8 CSV 到 {output}。",
+          "oracle": "shop:耳机",
+          "budget_seconds": 240,
+          "budget_calls": 24
+        },
+        {
+          "request": "同一个流程改查“相机”，保留已经验证过的链接降级方案和列顺序，重新运行并确认商品链接仍为真实 URL，输出到同一个文件。",
+          "oracle": "shop:相机",
+          "budget_seconds": 120,
+          "budget_calls": 12
+        }
+      ],
+      "extension": ".csv",
+      "edit_mode": "parameters",
+      "entry": "/shop",
+      "native_flow": {
+        "forbid_table_href": true
+      },
+      "manual_review_required": true
+    },
+    {
       "id": "web-sales-absent",
       "group": "web",
       "title": "评价数不是销量",

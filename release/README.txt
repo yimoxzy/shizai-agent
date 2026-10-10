@@ -1,9 +1,11 @@
-Shizai Agent 0.7.27 Windows release
+Shizai Agent 0.7.32 Windows release
 
 Files
 -----
 shizai-agent-mcp.exe  MCP stdio server for Codex and other MCP clients.
 shizai-agent.exe      Optional command-line client for diagnostics and setup.
+shizai-agent-browser-host.exe  Optional Native Messaging bootstrap host.
+browser-extension\    Independent visual grounding extension for Chrome/Edge.
 
 Codex MCP configuration (`%USERPROFILE%\.codex\config.toml`)
 -----------------------
@@ -28,15 +30,25 @@ designer session; it is independent from Codex OAuth support.
 
 Install options
 ---------------
-1. Run install.ps1 for automated download, checksum verification, installation,
-   and Codex registration.
-2. Extract the ZIP and run register-codex.ps1 for a portable installation.
+1. Run npx -y shizai-agent-mcp@latest install for automated download, checksum
+   verification, installation, and Codex registration (Node.js 18+ required).
+2. Extract the ZIP and run scripts/register-codex.ps1 for a portable installation.
    The script writes the persistent Codex config directly and does not need to
    start Codex during setup.
+3. Installation prepares the browser extension and registers its local host by
+   default. Load browser-extension once as an unpacked extension in
+   chrome://extensions or edge://extensions. File preparation does not mean the
+   browser has loaded it; check shizai_browser_status after loading.
+4. release-manifest.json records the actual frozen MCP tool lists and payload
+   hashes. Installers verify it before replacing an existing installation.
 
-PowerShell online install
--------------------------
-irm https://raw.githubusercontent.com/yimoxzy/shizai-agent/main/install.ps1 | iex
+Install from PowerShell
+-----------------------
+npx -y shizai-agent-mcp@latest install
+npx -y shizai-agent-mcp@latest status
+
+Do not use the old raw GitHub main installer. Source updates live on Gitee;
+GitHub Releases contains the verified compiled ZIP and checksum.
 
 After installation, restart Codex and enter `/mcp`. Use natural language; no
 `@` or other special invocation prefix is required.

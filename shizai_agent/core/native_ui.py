@@ -54,6 +54,7 @@ SCREENSHOT_PLUGIN_ACTION = "Element.ScreenshotCapture"
 SCREENSHOT_REQUESTER = "agentScreenShot"
 MASK_OPERATE_FROM = ("home", "normal")
 NATIVE_SCREENSHOT_CONTEXT_ERROR_CODE = "40009995"
+ACTIVE_EDITOR_TARGET = "$CurrentActiveEditorClientId$"
 
 SMALL_CARD_MESSAGES: dict[str, str] = {
     "takeover": "正在接管当前电脑环境。",
@@ -140,6 +141,7 @@ class _NativeUiChannel:
         service: str,
         method: str,
         args: list[Any],
+        response_timeout: float = 15.0,
     ) -> Any:
         call_id = f"cli-{uuid.uuid4()}"
         sock.send(
@@ -158,7 +160,7 @@ class _NativeUiChannel:
                 ensure_ascii=False,
             )
         )
-        result = self._wait_for(sock, call_id, "render-call-render-res")
+        result = self._wait_for(sock, call_id, "render-call-render-res", timeout=response_timeout)
         detail = _failure_detail(result, method)
         if detail:
             raise ShizaiCloudError(detail)
@@ -203,6 +205,37 @@ class _NativeUiChannel:
                     )
                 )
         raise ShizaiCloudError(f"Native UI call timed out: {packet_type}")
+
+
+def call_active_editor_renderer(
+    client: ShizaiDesktopAgent,
+    service: str,
+    method: str,
+    args: list[Any] | None = None,
+    *,
+    acquire_lock: bool = True,
+    response_timeout: float = 15.0,
+) -> Any:
+    """Call a service exposed by the currently active package editor."""
+    channel = _NativeUiChannel(client)
+    effective_timeout = max(0.25, min(float(response_timeout), 30.0))
+    def call() -> Any:
+        sock = client._connect(effective_timeout)
+        try:
+            return channel._call_renderer(
+                sock,
+                target_client_id=ACTIVE_EDITOR_TARGET,
+                service=service,
+                method=method,
+                args=args or [],
+                response_timeout=effective_timeout,
+            )
+        finally:
+            sock.close()
+    if not acquire_lock:
+        return call()
+    with _desktop_channel_lock(client.config.timeout, f"active editor {service}.{method}"):
+        return call()
 
 
 class NativeScreenshotCapture(_NativeUiChannel):

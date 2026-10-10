@@ -4,7 +4,7 @@
 
 ## 设计原则
 
-- MCP 默认暴露 56 个工具；可用 `SHIZAI_MCP_TOOL_PROFILE=rpa-authoring` 切换为 29 个原生 RPA 创建与参数编辑工具。两者共用 CLI 核心，不暴露通用 RPC。
+- MCP 默认暴露 67 个工具；可用 `SHIZAI_MCP_TOOL_PROFILE=rpa-authoring` 切换为 43 个原生 RPA 创建、组件追加/插入、视觉取证、参数编辑、按 revision 删除步骤、刷新、保存 editor 与单组件验证工具。两者共用 CLI 核心，不暴露通用 RPC。
 - 所有写入、运行和调试操作都要求 `allow_write=true`。
 - Agent graph 与原生 RPA 分开路由，网页任务不会误写成 Agent graph。
 - RPA 先读取实时组件契约，再写入客户端原生应用；不创建重复项目。
@@ -39,7 +39,7 @@ omit_tools_from = ["deferred"]
 
 ```powershell
 npx -y shizai-agent-mcp@latest install
-npx -y shizai-agent-mcp@latest register codex
+npx -y shizai-agent-mcp@latest status
 ```
 
 `Auth: Unsupported` 对本地 stdio MCP 是正常状态。服务本身不使用 MCP OAuth，设计器操作复用桌面登录会话。
@@ -49,6 +49,8 @@ npx -y shizai-agent-mcp@latest register codex
 源码 CLI 入口是 `shizai_agent/shizai_agent_cli.py`，MCP 入口是
 `shizai_agent/core/mcp_server.py`。完整路径、诊断命令和可复制测试提示词见
 [MCP 客户端接入与测试提示词](docs/MCP_CLIENT_SETUP.md)。
+独立多模态浏览器扩展的通信、双窗口设计步骤和原生组件绑定见
+[MCP 独立浏览器扩展](docs/MCP_BROWSER_EXTENSION.md)。
 
 ## AI 调用入口
 
@@ -72,8 +74,8 @@ shizai_rpa_analyze_request
 -> shizai_rpa_validate_plan
 -> shizai_rpa_start_design
 -> shizai_rpa_open_browser
--> shizai_rpa_capture_windows / shizai_rpa_scan_page
--> shizai_rpa_capture_elements
+-> shizai_browser_tabs / shizai_browser_activate_tab / shizai_browser_capture_viewport
+-> shizai_browser_inspect_points / shizai_browser_infer_collection
 -> shizai_rpa_validate_elements / shizai_project_import_elements
 -> shizai_rpa_add_step + shizai_rpa_validate_step
 -> shizai_rpa_validate_flow / shizai_rpa_validate_project
@@ -85,7 +87,7 @@ shizai_rpa_analyze_request
 `verification_gate` 是 CLI/MCP 共用的操作契约。模型不能只看到 `valid=true` 就继续追加；应按门中的
 `debug_capabilities -> debug_start/reuse -> debug_command(next) -> debug_status` 执行当前组件，结合页面截图/OCR或运行输出确认效果，再继续设计。OCR只能确认可见结果，不能替代 DeepCapture selector。
 
-识别、拆解、计划预检、应用创建和完整计划写入期间只显示设计状态，不接管电脑。`shizai_rpa_start_design` 默认 `open_browser=false`；完整图写入后调用 `shizai_rpa_open_browser`，此时才显示 5 秒倒计时和官方蓝紫接管边框。
+识别、拆解、计划预检、应用创建和完整计划写入期间只显示设计状态，不接管电脑。`shizai_rpa_start_design` 默认 `open_browser=false`；完整图写入后调用 `shizai_rpa_open_browser`，此时显示首次接管提示并从已保存的导航步骤打开真实页面供元素绑定。原生导航节点仍需通过后续设计态调试验证。
 
 组件顺序、等待策略、输出字段和输出格式只来自当前请求、实时组件契约和客户端模型提交的计划；MCP 不内置站点流程或默认字段。数量是完成契约：请求 100 条并允许翻页时，模型选择的方案需要持续到 100 条有效结果或已无下一页；可以使用组件内分页、显式下一页、循环、JavaScript、下载或多个组件组合。
 

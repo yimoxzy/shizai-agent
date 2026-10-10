@@ -118,13 +118,14 @@ workflow rpa-status
 
 ### 3.3 原生组件选择建议
 
-CLI/MCP 对组件选择采用“原生组件优先、替代方案可用”的建议策略。模型读取实时目录后，
+CLI 对组件选择保留“原生组件优先、替代方案可用”的建议策略。MCP 使用 native-first 预检：模型读取实时目录后，
 如果发现已安装、可物化且能力覆盖当前原子操作的原生组件，应先评估该组件；结构化网页采集
-优先评估 `WebBrowser_DataCollectionV5`。这条策略是 `advisory`/`warning_only`，不是写入或运行的硬条件。
+优先评估 `WebBrowser_DataCollectionV5`。平面采集仍允许模型在有证据时选择替代方案；父子/层级记录必须先写出
+`parent_collection`、`child_collection` 和 `record_alignment`，否则 `start_design` 会拒绝写入，避免单个长 JS 冒充完整采集流程。
 
 如果原生组件不适合当前页面、参数、输出或运行方式，模型可以选择 JS、下载、循环、条件或其它
 已安装组件组合，但需要记录选择原因，并以所选方案的 `step_validation`、运行期证据和输出契约验收。
-CLI 不会因为没有选择推荐组件而拒绝流程，也不会把这条建议改写为固定顺序、固定分页或固定站点配方。
+CLI 不会因为没有选择推荐组件而拒绝流程，也不会把这条建议改写为固定顺序、固定分页或固定站点配方；MCP 的层级阶段门只约束数据形状，不包含站点选择器。
 
 模型可从以下三个返回面读取该建议：
 
@@ -583,7 +584,7 @@ read -> validate parentId and argument types -> mutate -> persist
 
 追加组件还会拒绝以下结构：
 
-- 同一流程中第二个 `WebBrowser_DataCollectionV5`。
+- 同一平面流程中第二个没有 `collection_stage` 的 `WebBrowser_DataCollectionV5`；层级计划只有在每个采集节点声明不同阶段时才允许多个。
 - 已经出现 Excel 输出组件后再追加采集组件。
 
 这两个规则防止设计器把一个最终输出职责展开成多个互相覆盖的节点；已有坏项目不会被自动重写，校验和诊断会明确指出冲突。
@@ -733,7 +734,7 @@ CLI 优化完成后，至少应通过以下测试：
 5. 捕获成功后，元素 selector、页面指纹和绑定步骤可以回读。
 6. DeepCapture 已连接但 RuntimeHost 未连接时，诊断结果必须明确区分两者。
 7. `WebBrowser_CreateV3` 输出的浏览器变量可以被元素操作、JS 和采集组件引用。
-8. 完整流程只能有一个最终采集节点和一个最终 Excel 写入链路。
+8. 平面流程只能有一个最终采集节点和一个最终 Excel 写入链路；层级采集可以显式声明互不相同的 `parent_collection`、`child_collection` 阶段，但必须有后续父子对齐/输出步骤。
 9. 单步调试的每个停靠点都能通过 `rpa-debug-status` 查询。
 10. 最终成功必须有真实输出文件和业务数据证据，不能只依据静态校验结果；“至少 N 条”
     使用最低数量判断，超过 N 条不得判失败。

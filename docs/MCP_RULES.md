@@ -71,6 +71,9 @@ MCP 工具是否出现在当前对话，属于宿主客户端的挂载配置，�
 - 请求分析必须把中文全角标点视为 URL 边界。`https://www.jd.com，搜索电脑` 的 URL 只能是 `https://www.jd.com`；字段解析只能保留字段列表，`等可见商品信息`、`重点验证销量`、`根据实际页面决定分页` 是说明，不是字段。
 - 计划步骤缺少 `outputs` 时，可以依据固定原生组件契约补齐，例如 `WebBrowser_CreateV3 -> 网页对象`、`Element_SetValue_V6 -> 校验结果`、`WebBrowser_DataCollectionV5 -> 数据采集结果、Excel路径、监控空列数据`。模型明确写 `outputs: []` 时必须保留原意，不能静默覆盖；后续静态校验再报告真实不一致。
 - `page_identity_changed` 后保留原 `project_ref` 和当前 Chrome。先重新 `shizai_rpa_scan_page`，再用同一快照调用 `shizai_rpa_capture_elements`；只有模型明确传 `allow_rebind=true` 才允许绑定已绑定的 step。默认拒绝覆盖旧 selector，避免旧页元素污染结果页。
+- 活动 editor 有未保存修改时，完整运行和调试启动必须早退为 `editor_unsaved_changes`，并给出 `shizai_rpa_save_editor` 作为下一步；没有打开 editor 时不阻断。保存本身按 `expected_revision` 执行，保存后仍为脏状态时返回 `save_unconfirmed` 与 `retryable=true`，不得谎报成功。
+- 全局键盘组件（`Keyboard_*`）把真实按键发送到当前前台窗口，因此运行前必须核对目标 Chrome 窗口焦点：按流程元素的页面标题定位窗口，必要时还原并切到前台后复核前台句柄。无法确认焦点返回 `window_focus_unverified`，无法从标题确定目标窗口返回 `target_window_unknown`；两者都阻断当前组件，不允许静默放行。
+- 网页组件消费的是上游浏览器节点自己的输出变量，计划允许改名。`collection_web_page_binding` 与 `js_web_page_binding` 因此接受前驱节点的实际 `var_name`、计划输出名和规范默认 `网页对象`，失败时列出实际接受的名字。计划声明的输出可以少于组件原生写入的槽位，但多出的尾部槽位必须属于该组件的规范原生输出（例如 `监控空列数据`）；其它多余槽位仍然报错并在详情中点名。
 - MCP 客户端必须复用一个 stdio 进程完成 `initialize -> tools/list -> 工具调用 -> close`。每次工具调用重新启动 MCP 会丢失进程内分析缓存、DeepCapture 快照和调试会话，并制造假性的 `channel_unavailable`。
 - 调试停止无论官方停止 RPC 是否成功，都必须尽快持久化为 `stopped` 或 `cleanup_timeout`，不能让客户端无限停留在 `stopping`。停止顺序是 `AppRunService.stop` 后 `DebugAdapterService.disconnect`，结果要带 `retryable` 和下一步工具。
 - Native 小卡的 `openSmallCardWindow` 返回 `code=5000` 但后续 renderer 更新成功时，表示窗口可复用，不是 MCP 工具失败；返回 `open_nonfatal` 和 `open_result_status=reused_window`，不要把它当成流程阻断。

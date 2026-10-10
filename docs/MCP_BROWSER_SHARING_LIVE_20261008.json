@@ -1,0 +1,153 @@
+{
+  "kind": "source_mcp_real_extension_probe",
+  "native_rpa_executed": false,
+  "calls": [
+    {
+      "process": 1,
+      "tool": "status",
+      "attempt": 1,
+      "elapsed_ms": 2056.21,
+      "result": {
+        "kind": "mcp_browser_bridge_status",
+        "state": "extension_missing",
+        "connected": false,
+        "port": 18768,
+        "connection_mode": "owner",
+        "requires_user_action": true,
+        "extension_id": "onlmcbjbkkjllainhobbehhaohnkloem",
+        "retryable": true,
+        "resolution": "Open Chrome with the companion extension enabled; it reconnects automatically.",
+        "next_action": {
+          "tool": "shizai_browser_status",
+          "arguments": {
+            "connect_wait": 2
+          }
+        },
+        "bridge_listening": true
+      }
+    },
+    {
+      "process": 2,
+      "tool": "status",
+      "attempt": 1,
+      "elapsed_ms": 2063.47,
+      "result": {
+        "kind": "mcp_browser_bridge_status",
+        "state": "extension_missing",
+        "connected": false,
+        "port": 18768,
+        "connection_mode": "shared",
+        "requires_user_action": true,
+        "extension_id": "onlmcbjbkkjllainhobbehhaohnkloem",
+        "retryable": true,
+        "resolution": "Open Chrome with the companion extension enabled; it reconnects automatically.",
+        "next_action": {
+          "tool": "shizai_browser_status",
+          "arguments": {
+            "connect_wait": 2
+          }
+        },
+        "bridge_listening": true
+      }
+    },
+    {
+      "process": 1,
+      "tool": "status",
+      "attempt": 2,
+      "elapsed_ms": 2026.49,
+      "result": {
+        "kind": "mcp_browser_bridge_status",
+        "state": "extension_missing",
+        "connected": false,
+        "port": 18768,
+        "connection_mode": "owner",
+        "requires_user_action": true,
+        "extension_id": "onlmcbjbkkjllainhobbehhaohnkloem",
+        "retryable": true,
+        "resolution": "Open Chrome with the companion extension enabled; it reconnects automatically.",
+        "next_action": {
+          "tool": "shizai_browser_status",
+          "arguments": {
+            "connect_wait": 2
+          }
+        },
+        "bridge_listening": true
+      }
+    },
+    {
+      "process": 2,
+      "tool": "status",
+      "attempt": 2,
+      "elapsed_ms": 2003.17,
+      "result": {
+        "kind": "mcp_browser_bridge_status",
+        "state": "extension_missing",
+        "connected": false,
+        "port": 18768,
+        "connection_mode": "shared",
+        "requires_user_action": true,
+        "extension_id": "onlmcbjbkkjllainhobbehhaohnkloem",
+        "retryable": true,
+        "resolution": "Open Chrome with the companion extension enabled; it reconnects automatically.",
+        "next_action": {
+          "tool": "shizai_browser_status",
+          "arguments": {
+            "connect_wait": 2
+          }
+        },
+        "bridge_listening": true
+      }
+    },
+    {
+      "process": 1,
+      "tool": "status",
+      "attempt": 3,
+      "elapsed_ms": 2019.48,
+      "result": {
+        "kind": "mcp_browser_bridge_status",
+        "state": "extension_missing",
+        "connected": false,
+        "port": 18768,
+        "connection_mode": "owner",
+        "requires_user_action": true,
+        "extension_id": "onlmcbjbkkjllainhobbehhaohnkloem",
+        "retryable": true,
+        "resolution": "Open Chrome with the companion extension enabled; it reconnects automatically.",
+        "next_action": {
+          "tool": "shizai_browser_status",
+          "arguments": {
+            "connect_wait": 2
+          }
+        },
+        "bridge_listening": true
+      }
+    },
+    {
+      "process": 2,
+      "tool": "status",
+      "attempt": 3,
+      "elapsed_ms": 2068.6,
+      "result": {
+        "kind": "mcp_browser_bridge_status",
+        "state": "extension_missing",
+        "connected": false,
+        "port": 18768,
+        "connection_mode": "shared",
+        "requires_user_action": true,
+        "extension_id": "onlmcbjbkkjllainhobbehhaohnkloem",
+        "retryable": true,
+        "resolution": "Open Chrome with the companion extension enabled; it reconnects automatically.",
+        "next_action": {
+          "tool": "shizai_browser_status",
+          "arguments": {
+            "connect_wait": 2
+          }
+        },
+        "bridge_listening": true
+      }
+    }
+  ],
+  "version": "0.7.28",
+  "process_1_stderr_empty": true,
+  "process_2_stderr_empty": true
+}

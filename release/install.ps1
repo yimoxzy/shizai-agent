@@ -1,13 +1,23 @@
 [CmdletBinding()]
 param(
-    [string]$Version = '0.7.27',
+    [string]$Version = '0.7.32',
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ShizaiAgent'),
     [string]$PackagePath,
     [string]$ChecksumPath,
-    [switch]$SkipRegister
+    [switch]$SkipRegister,
+    [switch]$WithBrowserExtension,
+    [switch]$WithoutBrowserExtension
 )
 
 $ErrorActionPreference = 'Stop'
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+if ($InstallDir.TrimEnd('\') -eq [IO.Path]::GetPathRoot($InstallDir).TrimEnd('\') -or
+    $InstallDir.TrimEnd('\') -eq $env:USERPROFILE.TrimEnd('\')) { throw 'Unsafe installation directory.' }
+if ([IO.Directory]::Exists($InstallDir) -and @(Get-ChildItem -LiteralPath $InstallDir -Force).Count -gt 0 -and
+    -not [IO.File]::Exists((Join-Path $InstallDir 'shizai-agent-mcp.exe'))) { throw 'Refusing to replace an unrelated directory.' }
+$preserveBackup = $false
+$installCommitted = $false
+$backupDir = $null
 $releaseBase = "https://github.com/yimoxzy/shizai-agent/releases/download/v$Version"
 $assetName = "shizai-agent-v$Version-windows-x64.zip"
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("shizai-agent-install-" + [guid]::NewGuid().ToString('N'))
@@ -42,18 +52,23 @@ try {
     if ($rootFiles.Count -eq 0 -and $rootDirectories.Count -eq 1) {
         $payloadRoot = $rootDirectories[0].FullName
     }
-    foreach ($required in @('shizai-agent.exe', 'shizai-agent-mcp.exe', 'scripts\register-codex.ps1', 'scripts\unregister-codex.ps1', 'README.txt')) {
+    foreach ($required in @('shizai-agent.exe', 'shizai-agent-mcp.exe', 'shizai-agent-browser-host.exe', 'browser-extension\manifest.json', 'scripts\register-codex.ps1', 'scripts\unregister-codex.ps1', 'scripts\register-browser.ps1', 'scripts\unregister-browser.ps1', 'README.txt')) {
         if (-not [IO.File]::Exists((Join-Path $payloadRoot $required))) {
             throw "Release package is missing $required"
         }
     }
+
+    $verification = & (Join-Path $payloadRoot 'scripts\verify-package.ps1') -PackageRoot $payloadRoot -Version $Version | ConvertFrom-Json
+    $oldConfig = Join-Path $InstallDir 'browser-bridge.json'
+    if ([IO.File]::Exists($oldConfig)) { Copy-Item -LiteralPath $oldConfig -Destination $payloadRoot }
 
     # Stop the installed executables before replacing them.  Windows keeps an
     # executable locked while the MCP stdio process is alive, so copying first
     # makes upgrades fail even though the archive and checksum are valid.
     $runningTargets = @(
         (Join-Path $InstallDir 'shizai-agent-mcp.exe'),
-        (Join-Path $InstallDir 'shizai-agent.exe')
+        (Join-Path $InstallDir 'shizai-agent.exe'),
+        (Join-Path $InstallDir 'shizai-agent-browser-host.exe')
     ) | ForEach-Object { [IO.Path]::GetFullPath($_).ToLowerInvariant() }
     $running = @(Get-CimInstance Win32_Process | Where-Object {
         if (-not $_.ExecutablePath) { return $false }
@@ -65,32 +80,40 @@ try {
     # Move the old directory out of the way before copying.  This keeps the
     # replacement atomic and also handles a short-lived Windows file lock that
     # remains after the process exits.
-    $backupDir = Join-Path $temporaryRoot 'previous'
+    $backupDir = Join-Path ([IO.Path]::GetDirectoryName($InstallDir)) ('.shizai-agent-backup-' + [guid]::NewGuid().ToString('N'))
     if ([IO.Directory]::Exists($InstallDir)) {
         Move-Item -LiteralPath $InstallDir -Destination $backupDir -Force
     }
     try {
         [IO.Directory]::CreateDirectory($InstallDir) | Out-Null
         Copy-Item -Path (Join-Path $payloadRoot '*') -Destination $InstallDir -Recurse -Force
+        $versionMetadata = [ordered]@{
+            version = $Version
+            asset = $assetName
+            installedAt = [DateTime]::UtcNow.ToString('o')
+            manifest_sha256 = $verification.manifest_sha256
+            tools = $verification.tools
+        }
+        $versionMetadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $InstallDir 'version.json') -Encoding UTF8
+        $registration = $null
+        if (-not $SkipRegister) {
+            $registration = & (Join-Path $InstallDir 'scripts\register-codex.ps1') -McpPath (Join-Path $InstallDir 'shizai-agent-mcp.exe') | ConvertFrom-Json
+        }
+        $browserRegistration = $null
+        if (-not $WithoutBrowserExtension) {
+            $browserRegistration = & (Join-Path $InstallDir 'scripts\register-browser.ps1') -InstallDir $InstallDir | ConvertFrom-Json
+        }
+        $installCommitted = $true
     } catch {
-        if ([IO.Directory]::Exists($InstallDir)) {
-            [IO.Directory]::Delete($InstallDir, $true)
+        $installFailure = $_
+        try {
+            if ([IO.Directory]::Exists($InstallDir)) { [IO.Directory]::Delete($InstallDir, $true) }
+            if ([IO.Directory]::Exists($backupDir)) { Move-Item -LiteralPath $backupDir -Destination $InstallDir -Force }
+        } catch {
+            $preserveBackup = $true
+            throw "Installation rollback failed; previous installation preserved at $backupDir"
         }
-        if ([IO.Directory]::Exists($backupDir)) {
-            Move-Item -LiteralPath $backupDir -Destination $InstallDir -Force
-        }
-        throw
-    }
-    $versionMetadata = [ordered]@{
-        version = $Version
-        asset = $assetName
-        installedAt = [DateTime]::UtcNow.ToString('o')
-    }
-    $versionMetadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $InstallDir 'version.json') -Encoding UTF8
-
-    $registration = $null
-    if (-not $SkipRegister) {
-        $registration = & (Join-Path $InstallDir 'scripts\register-codex.ps1') -McpPath (Join-Path $InstallDir 'shizai-agent-mcp.exe') | ConvertFrom-Json
+        throw $installFailure
     }
 
     $auth = $null
@@ -103,13 +126,25 @@ try {
     [pscustomobject]@{
         installed = $true
         version = $Version
+        verified = $verification.verified
+        tools = $verification.tools
         directory = [IO.Path]::GetFullPath($InstallDir)
         registered = [bool]$registration.registered
+        browser_bridge_registered = [bool]$browserRegistration.registered
+        browser_extension_path = $browserRegistration.extension_path
+        browser_extension_loaded = $null
         designer_ready = [bool]$auth.ready
-        next_step = 'Restart Codex, open /mcp, then ask Codex to use shizai-agent. Auth: Unsupported is normal for this local stdio server.'
+        next_step = if (-not $WithoutBrowserExtension) { 'Load browser_extension_path once from chrome://extensions or edge://extensions; verify with shizai_browser_status. Restart the MCP client to load the new tool list.' } else { 'Restart your MCP client to load the new tool list.' }
     } | ConvertTo-Json -Depth 5
 } finally {
-    if ([IO.Directory]::Exists($temporaryRoot)) {
+    if ($installCommitted -and $backupDir -and [IO.Directory]::Exists($backupDir)) {
+        $backupPrefix = [IO.Path]::GetDirectoryName($InstallDir).TrimEnd('\') + '\.shizai-agent-backup-'
+        if (-not [IO.Path]::GetFullPath($backupDir).StartsWith($backupPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe backup cleanup path.' }
+        [IO.Directory]::Delete($backupDir, $true)
+    }
+    if ([IO.Directory]::Exists($temporaryRoot) -and -not $preserveBackup) {
+        $safePrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\shizai-agent-install-'
+        if (-not [IO.Path]::GetFullPath($temporaryRoot).StartsWith($safePrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe cleanup path.' }
         [IO.Directory]::Delete($temporaryRoot, $true)
     }
 }

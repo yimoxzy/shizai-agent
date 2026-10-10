@@ -24,6 +24,7 @@ from shizai_agent.core import (
     extension_bridge,
     mcp_server,
     project,
+    workflow_references,
 )
 from shizai_agent.core import (
     cloud_api as cloud_module,
@@ -196,6 +197,69 @@ def test_import_elements_converts_capture_and_preserves_native_shape(tmp_path):
     assert element["selector"]["selector"][0]["name"] == "tab"
     assert result["ui_feedback"]["phase"] == "elements_ready"
     assert result["ui_feedback"]["animation"] == "element_ready"
+
+
+def test_import_verified_reference_elements_preserves_provenance_and_resources(tmp_path):
+    paths = _paths(tmp_path)
+    source = _make_project(paths, "c_source")
+    target = _make_project(paths, "c_target")
+    project.import_elements(
+        paths,
+        str(source),
+        [{
+            "id": "search",
+            "name": "搜索框",
+            "title": "京东首页",
+            "url": "https://www.jd.com/",
+            "tag": "input",
+            "css_selector": "#search",
+        }],
+        capture_source="deep_capture",
+    )
+    source_payload = json.loads((source / "elements.json").read_text(encoding="utf-8"))
+    common = source_payload["elementMap"]["search"]["selector"]["commonProps"]
+    common["filePath"] = "res\\search\\capture.png"
+    common["resDirPath"] = "res\\search"
+    (source / "elements.json").write_text(json.dumps(source_payload), encoding="utf-8")
+    (source / "res" / "search").mkdir(parents=True)
+    (source / "res" / "search" / "capture.png").write_bytes(b"capture")
+
+    result = project.import_verified_reference_elements(
+        paths, str(target), str(source), ["search"]
+    )
+
+    imported = json.loads((target / "elements.json").read_text(encoding="utf-8"))["elementMap"]["search"]
+    assert result["kind"] == "verified_reference_elements_imported"
+    assert result["runtime_verification_required"] is True
+    assert imported["mcpCaptureSource"] == "deep_capture"
+    assert imported["mcpVerificationStatus"] == "verified"
+    assert imported["mcpReferenceSource"] == {"projectId": "c_source", "elementId": "search"}
+    assert imported["mcpReferenceRuntimeStatus"] == "pending"
+    assert (target / "res" / "search" / "capture.png").read_bytes() == b"capture"
+
+
+def test_import_verified_reference_elements_rejects_unverified_source(tmp_path):
+    paths = _paths(tmp_path)
+    source = _make_project(paths, "c_source")
+    target = _make_project(paths, "c_target")
+    project.import_elements(
+        paths,
+        str(source),
+        [{
+            "id": "search",
+            "name": "搜索框",
+            "title": "京东首页",
+            "url": "https://www.jd.com/",
+            "tag": "input",
+            "css_selector": "#search",
+        }],
+        capture_source="model_candidate",
+    )
+
+    with pytest.raises(ValueError, match="not extension-verified"):
+        project.import_verified_reference_elements(
+            paths, str(target), str(source), ["search"]
+        )
 
 
 def test_model_candidate_import_is_draft_and_blocks_flow_validation(tmp_path):
@@ -899,6 +963,43 @@ def test_rpa_request_analysis_handles_full_width_url_and_explanatory_suffixes():
     assert not any("根据实际页面决定是否分页" in field for field in analysis["evidence"]["requested_fields"])
 
 
+def test_rpa_request_analysis_strips_named_flow_metadata_and_extracts_windows_destination():
+    query = (
+        "新建一个名为“Luna评测-0.7.28-京东商品采集-final-f”的原生 RPA 流程。"
+        "真实打开京东，在首页搜索“电脑”，从真实搜索结果页采集商品标题、价格、商品链接、销量等可见信息，"
+        "不少于 100 条，并将 Excel 输出到 D:\\agent\\indeed_mcptest\\output。"
+    )
+
+    analysis = project.analyze_rpa_request(query)
+
+    assert analysis["evidence"]["flow_name"] == "Luna评测-0.7.28-京东商品采集-final-f"
+    assert analysis["evidence"]["quoted_values"] == ["电脑"]
+    assert analysis["evidence"]["requested_fields"] == ["商品标题", "价格", "商品链接", "销量"]
+    assert analysis["evidence"]["output_destinations"] == ["D:\\agent\\indeed_mcptest\\output"]
+    assert [item["type"] for item in analysis["operations"]] == ["navigate", "search", "extract", "output"]
+    assert analysis["unknowns"] == ["target_url"]
+
+
+def test_rpa_request_analysis_preserves_dotted_url_and_modifier_action_boundary():
+    query = (
+        "打开 http://127.0.0.1:18766/shop?layout=cards&seed=41，查询“耳机”，"
+        "优先使用实时原生数据采集组件采集商品编号、商品名称和商品链接，保存为 CSV。"
+    )
+
+    analysis = project.analyze_rpa_request(query)
+
+    assert analysis["evidence"]["urls"] == [
+        "http://127.0.0.1:18766/shop?layout=cards&seed=41"
+    ]
+    assert [item["type"] for item in analysis["operations"]] == [
+        "navigate",
+        "search",
+        "extract",
+        "output",
+    ]
+    assert analysis["operations"][0]["instruction"].endswith("layout=cards&seed=41")
+
+
 def test_rpa_plan_normalizes_fields_and_destination_into_output_file(tmp_path):
     _, analysis, plan = _generic_browser_plan_fixture()
     output_contract = {
@@ -1406,6 +1507,167 @@ def test_mcp_thin_plan_boundary_leaves_strategy_to_model():
     assert result["plan"]["steps"][0]["loop"]["until"] == "rows >= target"
 
 
+def test_mcp_collection_review_flags_js_only_structured_extraction():
+    _, analysis, plan = _generic_browser_plan_fixture()
+    available = {
+        item: {}
+        for item in (
+            "WebBrowser_CreateV3",
+            "Element_SetValue_V6",
+            "Keyboard_PressNew",
+            "Basic_Delay_V1",
+            "WebBrowser_GetTAB_V1",
+            "WebBrowser_RunJsInIeBySelector_v3",
+            "WebBrowser_DataCollectionV5",
+            "Excel_Cs_NewV4",
+            "Excel_Cs_WriteRange",
+        )
+    }
+
+    result = project.preflight_rpa_execution_plan(
+        analysis,
+        plan,
+        available_components=available,
+        planning_policy="mcp",
+    )
+
+    assert result["valid"] is True
+    review = result["native_collection_review"]
+    assert review["status"] == "required_review"
+    assert review["recommended_component"] == "WebBrowser_DataCollectionV5"
+    assert "native_alternative_reason" in review["model_directive"]
+    assert any("必须先比较其契约" in item for item in result["normalization_warnings"])
+
+
+def test_rpa_analysis_declares_generic_parent_child_collection_stages():
+    analysis = project.analyze_rpa_request(
+        "打开抖音视频，抓取全部视频评论和评论留言，即一级评论和二级评论，并写入数据库。"
+    )
+
+    collection = analysis["evidence"]["collection"]
+    assert collection["shape"] == "hierarchical"
+    assert [item["id"] for item in collection["stages"]] == [
+        "parent_collection",
+        "child_collection",
+        "record_alignment",
+    ]
+    assert analysis["planning_requirements"]["collection_decision"]["record_shape"] == "hierarchical"
+    assert analysis["planning_requirements"]["collection_decision"]["must_use_single_component"] is False
+
+
+def test_hierarchical_collection_uses_generic_relationship_terms_and_plan_shape():
+    generic = project.analyze_rpa_request("打开列表，采集父记录和子记录并输出。")
+    assert generic["evidence"]["collection"]["shape"] == "hierarchical"
+    source = inspect.getsource(project.analyze_rpa_request)
+    assert "一级评论" not in source and "二级评论" not in source
+
+    implicit = project.analyze_rpa_request("打开列表，采集每条记录的明细并输出。")
+    assert implicit["evidence"]["collection"].get("shape", "flat") == "flat"
+    plan = {
+        "analysis_id": implicit["analysis_id"],
+        "collection_shape": "hierarchical",
+        "steps": [
+            {"id": "open", "component": "WebBrowser_CreateV3", "config": {"url": "https://example.test"}},
+            {
+                "id": "parents",
+                "component": "WebBrowser_DataCollectionV5",
+                "collection_stage": "parent_collection",
+                "config": {"columns": ["记录"], "var0": "parent_records", "output_file": "parents.xlsx"},
+            },
+        ],
+    }
+    result = project.preflight_rpa_execution_plan(
+        implicit,
+        plan,
+        available_components={"WebBrowser_CreateV3": {}, "WebBrowser_DataCollectionV5": {}},
+        planning_policy="native_first",
+    )
+    assert result["valid"] is False
+    assert result["error_code"] == "collection_stage_plan_required"
+
+
+def test_mcp_collection_review_requires_two_native_stages_for_hierarchical_records():
+    analysis = project.analyze_rpa_request(
+        "打开抖音视频，采集一级评论和二级评论，保留父子关系并输出。"
+    )
+    available = {
+        "WebBrowser_CreateV3": {},
+        "WebBrowser_DataCollectionV5": {},
+        "Excel_Cs_WriteRange": {},
+    }
+    partial = {
+        "analysis_id": analysis["analysis_id"],
+        "steps": [
+            {
+                "id": "open",
+                "component": "WebBrowser_CreateV3",
+                "config": {"url": "https://example.test"},
+            },
+            {
+                "id": "parents",
+                "component": "WebBrowser_DataCollectionV5",
+                "collection_stage": "parent_collection",
+                "config": {"columns": ["一级评论"], "var0": "parent_records", "output_file": "parents.xlsx"},
+            },
+        ],
+        "output_contract": {"columns": ["一级评论", "二级评论"], "file": "result.xlsx"},
+    }
+    partial_result = project.preflight_rpa_execution_plan(
+        analysis,
+        partial,
+        available_components=available,
+        planning_policy="mcp",
+    )
+    assert partial_result["valid"] is True
+    assert partial_result["native_collection_review"]["status"] == "stage_plan_required"
+    assert "child_collection" in partial_result["native_collection_review"]["model_directive"]
+
+    native_first_result = project.preflight_rpa_execution_plan(
+        analysis,
+        partial,
+        available_components=available,
+        planning_policy="native_first",
+    )
+    assert native_first_result["valid"] is False
+    assert native_first_result["error_code"] == "collection_stage_plan_required"
+    assert native_first_result["policy"] == {
+        "mode": "native_first",
+        "strategy_checks": "hierarchical_native_gate",
+    }
+
+    complete = deepcopy(partial)
+    complete["steps"].extend(
+        [
+            {
+                "id": "children",
+                "component": "WebBrowser_DataCollectionV5",
+                "collection_stage": "child_collection",
+                "parent_step_id": "parents",
+                "config": {"columns": ["二级评论"], "var0": "child_records", "output_file": "children.xlsx"},
+            },
+            {
+                "id": "align",
+                "component": "Excel_Cs_WriteRange",
+                "collection_stage": "record_alignment",
+                "merge_key": "comment_id",
+                "config": {"workbook": "parent_records", "contents": "child_records"},
+            },
+        ]
+    )
+    complete_result = project.preflight_rpa_execution_plan(
+        analysis,
+        complete,
+        available_components=available,
+        planning_policy="mcp",
+    )
+    assert complete_result["valid"] is True
+    assert complete_result["native_collection_review"]["status"] == "native_staged"
+    assert complete_result["native_collection_review"]["selected_native_stages"] == [
+        "parent_collection",
+        "child_collection",
+    ]
+
+
 def test_mcp_thin_plan_boundary_still_rejects_unknown_component():
     analysis = project.analyze_rpa_request("打开京东网页并采集商品标题。")
     result = project.preflight_rpa_execution_plan(
@@ -1666,7 +1928,44 @@ def test_flexible_model_plan_keeps_strategy_choices_advisory():
     assert not any("pagination" in warning for warning in result["normalization_warnings"])
 
 
-def test_thin_mcp_plan_fills_omitted_native_outputs_but_preserves_explicit_empty():
+def test_flexible_browser_plan_rejects_missing_search_interaction():
+    query = "打开商品页，查询“耳机”，采集商品名称并输出。"
+    analysis = project.analyze_rpa_request(query)
+    operation_ids = {item["type"]: item["id"] for item in analysis["operations"]}
+    plan = {
+        "analysis_id": analysis["analysis_id"],
+        "validation_mode": "flexible",
+        "steps": [
+            {
+                "id": "open",
+                "component": "WebBrowser_CreateV3",
+                "operation_ids": [operation_ids["navigate"]],
+                "config": {"url": "https://example.test/products"},
+            },
+            {
+                "id": "collect",
+                "component": "WebBrowser_DataCollectionV5",
+                "operation_ids": [operation_ids["extract"], operation_ids["output"]],
+                "depends_on": ["open"],
+                "inputs": ["网页对象"],
+                "config": {"columns": ["商品名称"], "output_file": "result.csv"},
+            },
+        ],
+        "output_contract": {"columns": ["商品名称"], "file": "result.csv"},
+    }
+
+    result = project.preflight_rpa_execution_plan(
+        analysis,
+        plan,
+        planning_policy="flexible",
+    )
+
+    assert result["valid"] is False
+    assert "does not implement analyzed page interactions" in result["error"]
+    assert operation_ids["search"] in result["error"]
+
+
+def test_thin_mcp_plan_derives_native_outputs_even_when_client_supplies_empty():
     analysis = project.analyze_rpa_request("打开京东，搜索“手机”，采集商品标题并输出。")
     plan = {
         "analysis_id": analysis["analysis_id"],
@@ -1683,13 +1982,13 @@ def test_thin_mcp_plan_fills_omitted_native_outputs_but_preserves_explicit_empty
 
     filled = project.validate_mcp_rpa_plan(analysis, deepcopy(plan))
     assert filled["plan"]["steps"][0]["outputs"] == ["网页对象"]
-    assert any("omitted outputs" in warning for warning in filled["normalization_warnings"])
+    assert any("MCP generated logical outputs" in warning for warning in filled["normalization_warnings"])
 
     explicit_empty = deepcopy(plan)
     explicit_empty["steps"][0]["outputs"] = []
-    preserved = project.validate_mcp_rpa_plan(analysis, explicit_empty)
-    assert preserved["plan"]["steps"][0]["outputs"] == []
-    assert not any("omitted outputs" in warning for warning in preserved["normalization_warnings"])
+    normalized = project.validate_mcp_rpa_plan(analysis, explicit_empty)
+    assert normalized["plan"]["steps"][0]["outputs"] == ["网页对象"]
+    assert any("MCP generated logical outputs" in warning for warning in normalized["normalization_warnings"])
 
 
 def test_js_result_mode_aliases_are_normalized_at_plan_boundary():
@@ -2196,6 +2495,52 @@ def test_rpa_append_guard_rejects_duplicate_collection_and_collection_after_exce
         )
 
 
+def test_rpa_append_guard_allows_explicit_parent_child_collection_stages(tmp_path):
+    paths = _paths(tmp_path)
+    element = {
+        "id": "comment-text",
+        "name": "评论文本",
+        "title": "评论页",
+        "url": "https://example.test/video",
+        "tag": "div",
+        "css_selector": ".comment-text",
+    }
+    flow = tmp_path / "staged-parent-child"
+    project.create_rpa_flow(str(flow), required_columns=["评论文本"])
+    project.add_rpa_step(
+        paths,
+        str(flow),
+        "WebBrowser_CreateV3",
+        step_id="open",
+        config={"url": "https://example.test/video"},
+    )
+    project.import_elements(paths, str(flow), [element])
+    project.add_rpa_step(
+        paths,
+        str(flow),
+        "WebBrowser_DataCollectionV5",
+        step_id="parents",
+        element_ids=["comment-text"],
+        config={"collection_stage": "parent_collection", "output_file": "parents.xlsx"},
+    )
+    project.add_rpa_step(
+        paths,
+        str(flow),
+        "WebBrowser_DataCollectionV5",
+        step_id="children",
+        element_ids=["comment-text"],
+        config={"collection_stage": "child_collection", "output_file": "children.xlsx"},
+    )
+    steps = project.read_rpa_flow(paths, str(flow))["flow"]["steps"]
+    assert [
+        step["collection_stage"]
+        for step in steps
+        if step.get("component") == "WebBrowser_DataCollectionV5"
+    ] == ["parent_collection", "child_collection"]
+    validated = project.validate_rpa_flow(paths, str(flow))
+    assert validated["valid"] is True, validated.get("errors")
+
+
 def test_native_designer_state_consistency_reports_stale_derived_files(tmp_path):
     paths = _paths(tmp_path)
     native = _make_project(paths, "stale-native")
@@ -2464,7 +2809,7 @@ def test_staged_js_link_recovery_persists_result_state_and_validates(tmp_path):
                     "value": project.JS_NAME_MARKER,
                     "textValue": project.JS_NAME_MARKER,
                     "pattern": "equal",
-                    "accurate": "false",
+                    "accurate": "true",
                     "expressionValue": "",
                 }
             ],
@@ -2715,9 +3060,12 @@ def test_start_rpa_design_creates_client_owned_native_flow(tmp_path, monkeypatch
             "name": label,
             "title": "结果页",
             "url": "https://example.test/results",
-            "tag": "div",
-            "css_selector": selector,
-            "attributes": {"id": item_id},
+                "tag": "a" if item_id == "link" else "div",
+                "css_selector": selector,
+                "attributes": {
+                    "id": item_id,
+                    **({"href": "https://example.test/product/1"} if item_id == "link" else {}),
+                },
         }
         for item_id, label, selector in [
             ("name", "商品名称", ".name"),
@@ -2755,6 +3103,20 @@ def test_start_rpa_design_creates_client_owned_native_flow(tmp_path, monkeypatch
         "attributes": {"aria-label": "下一页"},
     }
     project.import_elements(paths, str(native), [next_page], capture_source="deep_capture")
+    elements_before_preview = (native / "elements.json").read_bytes()
+    task_before_preview = (native / "io5cd.task").read_bytes()
+    preview = project.update_rpa_step_config(
+        paths,
+        str(native),
+        "collect-products",
+        {"region": 2, "selector_page": "next-page"},
+        dry_run=True,
+        client=client,
+    )
+    assert preview["saved"] is False
+    assert preview["elements_changed"] is True
+    assert (native / "elements.json").read_bytes() == elements_before_preview
+    assert (native / "io5cd.task").read_bytes() == task_before_preview
     pagination = project.bind_rpa_pagination(
         paths,
         str(native),
@@ -2773,6 +3135,7 @@ def test_start_rpa_design_creates_client_owned_native_flow(tmp_path, monkeypatch
         str(native),
         "collect-products",
         {
+            "designated_obj": "网页对象",
             "columns": ["商品标题", "商品价格", "商品链接", "商品销量"],
             "data_attributes": {
                 "商品标题": "innerText",
@@ -2787,6 +3150,8 @@ def test_start_rpa_design_creates_client_owned_native_flow(tmp_path, monkeypatch
     )
     updated_task = json.loads((native / "io5cd.task").read_text(encoding="utf-8"))
     updated_node = updated_task["componentModelEntities"]["collect-products"]
+    updated_args = {item["name"]: item["value"] for item in updated_node["args0"]}
+    assert updated_args["designated_obj"] == "网页对象"
     updated_nested = json.loads(next(item for item in updated_node["args0"] if item["name"] == "config")["value"])
     assert updated_nested["pageInfo"]["pageUrl"] == "https://example.test/results?keyword=平板"
     assert updated_nested["pageInfo"]["windowTitle"] == "平板结果页"
@@ -2799,6 +3164,21 @@ def test_start_rpa_design_creates_client_owned_native_flow(tmp_path, monkeypatch
     assert [item["dataAttrName"] for item in updated_nested["collectionConfig"]["columnConfigArray"]] == [
         "innerText", "innerText", "href", "innerText"
     ]
+    assert json.loads((native / "szrpa.json").read_text(encoding="utf-8"))["mcpMaxRows"] == 0
+    project.update_rpa_step_config(
+        paths,
+        str(native),
+        "collect-products",
+        {"page_title": "平板结果页（已确认）"},
+        client=client,
+    )
+    title_only_task = json.loads((native / "io5cd.task").read_text(encoding="utf-8"))
+    title_only_node = title_only_task["componentModelEntities"]["collect-products"]
+    title_only_nested = json.loads(
+        next(item for item in title_only_node["args0"] if item["name"] == "config")["value"]
+    )
+    assert title_only_nested["pageInfo"]["pageUrl"] == "https://example.test/results?keyword=平板"
+    assert title_only_nested["pageInfo"]["windowTitle"] == "平板结果页（已确认）"
     # Rebinding with a fresh capture regenerates selectors in the same order;
     # RuntimeHost must never retain the previous five-column selector set.
     rebound = project.set_rpa_step_elements(
@@ -2910,9 +3290,12 @@ def test_native_rpa_runtime_maps_package_ids_and_task_node(tmp_path):
             "name": label,
             "title": "结果页",
             "url": "https://example.test/results",
-            "tag": "div",
+            "tag": "a" if item_id == "link" else "div",
             "css_selector": selector,
-            "attributes": {"id": item_id},
+            "attributes": {
+                "id": item_id,
+                **({"href": "https://example.test/product/1"} if item_id == "link" else {}),
+            },
         }
         for item_id, label, selector in [
             ("name", "商品名称", ".name"),
@@ -3305,6 +3688,77 @@ def test_native_run_timeout_uses_common_runtime_cleanup(tmp_path, monkeypatch):
     assert persisted["cleanup_reason"] == "wait_timeout"
 
 
+def test_native_run_cleans_failed_owned_debug_session_before_submit(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    target = _make_project(paths, "native-run-after-debug-failure")
+    task = target / "io5cd.task"
+    task.write_text(
+        json.dumps(
+            {
+                "componentModelEntities": {
+                    "MAIN_COMPONENT": {"args0": [{"name": "statements", "value": []}]}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    diagnosis = {
+        "can_run": True,
+        "can_attempt_run": True,
+        "errors": [],
+        "warnings": [],
+        "package": {"application_id": "app", "package_id": "pkg"},
+        "task": {"path": str(task), "node_id": "io5cd"},
+    }
+    monkeypatch.setattr(project, "native_rpa_sync_diagnose", lambda *_args, **_kwargs: diagnosis)
+    monkeypatch.setattr(project, "_normalize_native_page_scope_js", lambda *_args, **_kwargs: (task, {}))
+    monkeypatch.setattr(project, "_ensure_native_runtime_support", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(project, "_sync_native_designer_content", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(project, "_native_rpa_state", lambda *_args, **_kwargs: {"steps": []})
+    monkeypatch.setattr(
+        project,
+        "native_rpa_status",
+        lambda *_args, **_kwargs: {"status": "submitted", "ui_feedback": {}, "run": {}},
+    )
+    from shizai_agent.core import debug_session
+
+    events = []
+    monkeypatch.setattr(
+        debug_session,
+        "debug_capabilities",
+        lambda *_args, **_kwargs: {
+            "active_session": False,
+            "cleanup_required": True,
+            "session_status": "runtime_error",
+        },
+    )
+    monkeypatch.setattr(
+        debug_session,
+        "debug_stop",
+        lambda *_args, **_kwargs: events.append("debug_stop")
+        or {"stopped": True, "cleanup_complete": True, "errors": []},
+    )
+
+    class Client:
+        def call(self, service, method, args):
+            assert (service, method) == ("CorpBrainService", "workflowDebugRunRPA")
+            events.append("production_run")
+            return {"isSuccess": True, "data": {"accepted": True}}
+
+    result = project.native_rpa_run(paths, str(target), wait=False, client=Client())
+
+    assert events == ["debug_stop", "production_run"]
+    assert result["design_validation_cleanup"] == {
+        "active_before_run": False,
+        "cleanup_required_before_run": True,
+        "session_status_before_run": "runtime_error",
+        "deep_capture_touched": False,
+        "stopped": True,
+        "cleanup_complete": True,
+        "errors": [],
+    }
+
+
 def test_cli_rpa_start_design_defaults_to_client_application(monkeypatch):
     calls = []
 
@@ -3527,7 +3981,7 @@ def test_mcp_rpa_start_design_returns_created_flow_when_browser_open_fails(monke
     monkeypatch.setattr(mcp_server.project_core, "rpa_components", lambda *args, **kwargs: {"components": []})
     monkeypatch.setattr(
         mcp_server,
-        "_rpa_run_navigation_component",
+        "_rpa_open_capture_target",
         lambda *args, **kwargs: (_ for _ in ()).throw(ShizaiCloudError("navigation fixture unavailable")),
     )
     result = mcp_server._dispatch(
@@ -3584,8 +4038,12 @@ def test_mcp_rpa_start_design_initializes_capture_without_red_picker_after_brows
     monkeypatch.setattr(mcp_server.project_core, "rpa_components", lambda *args, **kwargs: {"components": []})
     monkeypatch.setattr(
         mcp_server,
-        "_rpa_run_navigation_component",
-        lambda *args, **kwargs: {"executed": True, "navigation": {"step_id": "open-target"}},
+        "_rpa_open_capture_target",
+        lambda *args, **kwargs: {
+            "opened": True,
+            "method": "current_chrome_design_helper",
+            "navigation": {"step_id": "open-target"},
+        },
     )
     monkeypatch.setattr(mcp_server, "ShizaiExtensionBridge", FakeBridge)
     monkeypatch.setattr(mcp_server, "_desktop_client", lambda: object())
@@ -3639,8 +4097,12 @@ def test_mcp_rpa_start_design_returns_capture_warning_and_retry_after_capture_fa
     monkeypatch.setattr(mcp_server.project_core, "rpa_components", lambda *args, **kwargs: {"components": []})
     monkeypatch.setattr(
         mcp_server,
-        "_rpa_run_navigation_component",
-        lambda *args, **kwargs: {"executed": True, "navigation": {"step_id": "open-target"}},
+        "_rpa_open_capture_target",
+        lambda *args, **kwargs: {
+            "opened": True,
+            "method": "current_chrome_design_helper",
+            "navigation": {"step_id": "open-target"},
+        },
     )
     monkeypatch.setattr(mcp_server, "ShizaiExtensionBridge", BrokenBridge)
     monkeypatch.setattr(mcp_server, "_desktop_client", lambda: object())
@@ -3699,9 +4161,14 @@ def test_mcp_rpa_takeover_countdown_starts_after_plan_design_and_before_browser_
     monkeypatch.setattr(mcp_server.project_core, "rpa_components", lambda *args, **kwargs: {"components": []})
     monkeypatch.setattr(
         mcp_server,
-        "_rpa_run_navigation_component",
+        "_rpa_open_capture_target",
         lambda *args, **kwargs: (
-            events.append("navigation_step") or {"executed": True, "navigation": {"step_id": "open-target"}}
+            events.append("browser_open")
+            or {
+                "opened": True,
+                "method": "current_chrome_design_helper",
+                "navigation": {"step_id": "open-target"},
+            }
         ),
     )
 
@@ -3720,7 +4187,7 @@ def test_mcp_rpa_takeover_countdown_starts_after_plan_design_and_before_browser_
     assert events.index("create") < events.index("persist_plan")
     assert events.index("persist_plan") < events.index("ready")
     assert events.index("ready") < events.index("takeover")
-    assert events.index("takeover") < events.index("navigation_step")
+    assert events.index("takeover") < events.index("browser_open")
 
 
 def test_mcp_rpa_analyze_request_shows_designing_without_takeover(monkeypatch):
@@ -4060,6 +4527,32 @@ def test_extension_selector_envelope_is_unwrapped_and_normalized():
     assert record["selector"]["commonProps"]["GUIType"] == "Chrome"
 
 
+def test_extension_element_identity_prefers_exact_selector_over_restore_window_hint():
+    selector = {
+        "commonProps": {"GUIType": "Chrome", "processName": "chrome.exe"},
+        "selector": [
+            {
+                "name": "Window",
+                "type": "32",
+                "props": [{"name": "title", "value": '"组件测评商城 - Google Chrome"'}],
+            },
+            {"name": "Document", "type": "6", "props": []},
+            {"name": "Text", "type": "6", "props": [{"name": "name", "value": '"P001"'}]},
+        ],
+    }
+
+    record = _element_record(
+        "uia:product-id",
+        {"elementAlias": "text_P001"},
+        selector,
+        page_title="要恢复页面吗？",
+        page_url="https://stale.example/",
+    )
+
+    assert record["page_title"] == "组件测评商城 - Google Chrome"
+    assert record["page_url"] == "https://stale.example/"
+
+
 def test_extension_uia_chrome_document_chain_is_normalized_to_chrome():
     selector = {
         "commonProps": {"GUIType": "Windows", "processName": "chrome.exe"},
@@ -4223,6 +4716,58 @@ def test_native_element_input_uses_browser_output_binding(tmp_path):
     assert args["isEnter"] == "0"
 
 
+def test_native_designer_flow_without_mcp_plan_allows_duplicate_catalog_component(tmp_path):
+    paths = _paths(tmp_path)
+    native = _make_project(paths, "manual-browser-flow")
+    (native / "io5cd.task").write_text(
+        json.dumps(
+            {
+                "componentModelEntities": {
+                    "MAIN_COMPONENT": {
+                        "id": "MAIN_COMPONENT",
+                        "type": "main",
+                        "args0": [{"name": "statements", "value": []}],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    project.add_rpa_step(
+        paths,
+        str(native),
+        "WebBrowser_CreateV3",
+        step_id="manual-open",
+        config={"type": "chrome", "url": "www.jd.com", "openNewTab": True},
+    )
+    metadata_path = native / "szrpa.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_path.write_text(
+        json.dumps({key: value for key, value in metadata.items() if not key.startswith("mcp")}),
+        encoding="utf-8",
+    )
+
+    added = project.add_rpa_step(
+        paths,
+        str(native),
+        "WebBrowser_CreateV3",
+        step_id="mcp-open-copy",
+        config={"type": "chrome", "url": "www.jd.com", "openNewTab": True},
+    )
+
+    state = project.read_rpa_flow(paths, str(native))["flow"]
+    assert [step["component"] for step in state["steps"]] == ["WebBrowser_CreateV3", "WebBrowser_CreateV3"]
+    assert [step["config"]["url"] for step in state["steps"]] == ["www.jd.com", "www.jd.com"]
+    task = json.loads((native / "io5cd.task").read_text(encoding="utf-8"))
+    duplicate_args = {item["name"]: item["value"] for item in task["componentModelEntities"]["mcp-open-copy"]["args0"]}
+    assert duplicate_args["isRemote"] == "0"
+    assert json.loads(duplicate_args["ipAddress"]) == ""
+    assert json.loads(duplicate_args["port"]) == "61619"
+    assert json.loads(duplicate_args["arguments"]) == ""
+    assert added["step_validation"]["valid"] is True
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["mcpPlanningPolicy"] == "model_decides"
+
+
 def test_selector_property_parser_accepts_designer_serialized_property_text():
     raw = '@{name=class; value="jd_search"; pattern=equal; accurate=false; textValue=jd_search; expressionValue="jd_search"}'
     parsed = project._selector_property_dict(raw)
@@ -4258,6 +4803,117 @@ def test_compact_web_selector_drops_transient_ancestor_indexes():
     assert not any(prop["name"] == "@index" for item in compact["selector"] for prop in item["props"])
 
 
+def test_compact_web_selector_uses_form_name_and_decodes_it_once():
+    element = {
+        "GUIType": "Chrome",
+        "page_title": "组件测评商城",
+        "page_url": "http://127.0.0.1:18766/shop?seed=31",
+        "selector": {
+            "commonProps": {"cssSelector": ""},
+            "selector": [
+                {"name": "tab", "props": []},
+                {"name": "div", "type": "web", "props": [{"name": "@index", "value": "1"}]},
+                {"name": "div", "type": "web", "props": [{"name": "@index", "value": "0"}]},
+                {
+                    "name": "input",
+                    "type": "web",
+                    "props": [
+                        {
+                            "name": "name",
+                            "value": '"商品关键词"',
+                            "textValue": "商品关键词",
+                            "expressionValue": '"商品关键词"',
+                        },
+                        {"name": "@index", "value": "1", "expressionValue": "1"},
+                    ],
+                },
+            ],
+        },
+    }
+
+    compact = project._native_web_selector(element, element["selector"])
+
+    assert [item["name"] for item in compact["selector"]] == ["tab", "input"]
+    target_props = compact["selector"][1]["props"]
+    assert target_props == [
+        {
+            "name": "name",
+            "value": "商品关键词",
+            "pattern": "equal",
+            "accurate": "false",
+            "textValue": "商品关键词",
+            "expressionValue": "",
+        }
+    ]
+    assert json.loads(compact["commonProps"]["cssSelector"]) == 'input[name="商品关键词"]'
+    assert not any(prop["name"] == "@index" for item in compact["selector"] for prop in item["props"])
+
+
+def test_compact_web_selector_maps_deep_capture_link_name_without_ancestor_indexes_or_css():
+    element = {
+        "GUIType": "Chrome",
+        "mcpCaptureSource": "deep_capture",
+        "page_title": "组件测评商城",
+        "page_url": "http://127.0.0.1:18766/shop?q=手机",
+        "selector": {
+            "commonProps": {"cssSelector": ""},
+            "selector": [
+                {"name": "tab", "props": []},
+                {"name": "div", "type": "web", "props": [{"name": "@index", "value": "4"}]},
+                {
+                    "name": "a",
+                    "type": "web",
+                    "props": [
+                        {
+                            "name": "name",
+                            "value": '"下一页"',
+                            "textValue": "下一页",
+                            "expressionValue": '"下一页"',
+                        },
+                        {"name": "@index", "value": "0", "expressionValue": "0"},
+                    ],
+                },
+            ],
+        },
+    }
+
+    compact = project._native_web_selector(element, element["selector"])
+
+    assert [item["name"] for item in compact["selector"]] == ["tab", "a"]
+    assert compact["selector"][1]["props"] == [
+        {
+            "name": "innertext",
+            "value": "下一页",
+            "pattern": "equal",
+            "accurate": "false",
+            "textValue": "下一页",
+            "expressionValue": "",
+        }
+    ]
+    assert compact["commonProps"]["cssSelector"] == ""
+
+
+def test_native_web_selector_compacts_uia_link_on_first_import():
+    native = {
+        "commonProps": {"cssSelector": "", "GUIType": "Chrome"},
+        "selector": [
+            {"name": "Window", "type": "32", "props": []},
+            {"name": "Document", "type": "6", "props": [{"name": "name", "value": "结果页"}]},
+            {"name": "Group", "type": "6", "props": [{"name": "@index", "value": "4"}]},
+            {"name": "Hyperlink", "type": "6", "props": [{"name": "name", "value": "下一页"}]},
+        ],
+    }
+
+    compact = project._native_web_selector(
+        {"GUIType": "Chrome", "page_title": "结果页", "selector": native},
+        native,
+    )
+
+    assert [item["name"] for item in compact["selector"]] == ["tab", "a"]
+    assert compact["selector"][1]["props"][0]["name"] == "innertext"
+    assert compact["selector"][1]["props"][0]["value"] == "下一页"
+
+
 def test_native_selector_expression_only_wraps_uia_selector():
     web = {"mcpSelectorMode": "web", "selector": {"selector": [{"name": "input", "type": "web"}]}}
     uia = {"selector": {"selector": [{"name": "Edit", "type": "6"}]}}
@@ -4268,9 +4924,15 @@ def test_native_selector_expression_only_wraps_uia_selector():
     )
 
 
-def test_native_page_selector_always_uses_runtime_page_wrapper():
-    assert project._native_page_selector_expression("product") == (
-        'elementsFormatNew(SHIZAI_ELEMENT_DICT["product"]["selector"])'
+def test_native_page_selector_uses_collection_formatter_for_all_selector_sources():
+    web = {"mcpSelectorMode": "web", "selector": {"selector": [{"name": "a", "type": "web"}]}}
+    uia = {"selector": {"selector": [{"name": "Hyperlink", "type": "6"}]}}
+
+    assert project._native_page_selector_expression("next", web) == (
+        'elementsFormatNew(SHIZAI_ELEMENT_DICT["next"]["selector"])'
+    )
+    assert project._native_page_selector_expression("next", uia) == (
+        'elementsFormatNew(SHIZAI_ELEMENT_DICT["next"]["selector"])'
     )
 
 
@@ -4465,6 +5127,30 @@ class _FakeCaptureDesktop:
         return {"isSuccess": True, "data": {"code": 0}}
 
 
+@pytest.mark.parametrize("probe_succeeds", [True, False])
+def test_extension_status_distinguishes_authenticated_channel_from_deep_capture_probe(
+    monkeypatch,
+    probe_succeeds,
+):
+    class ProbeDesktop(_FakeCaptureDesktop):
+        def call(self, service, method, args=None):
+            if not probe_succeeds and method == "getDeepCaptureElementChildrenById":
+                raise ShizaiCloudError("DeepCaptureService timeout")
+            return super().call(service, method, args)
+
+    monkeypatch.setattr(extension_bridge, "_extension_installation", lambda: {})
+    monkeypatch.setattr(extension_bridge, "_read_manifest", lambda _status: None)
+    monkeypatch.setattr(extension_bridge, "_runtime_extension_status", lambda: {"ready": True})
+
+    result = ShizaiExtensionBridge(desktop=ProbeDesktop()).status(probe_deep_capture=True)
+
+    assert result["desktop"]["ready"] is True
+    assert result["deep_capture_rpc_verified"] is True
+    assert result["deep_capture_rpc"] is probe_succeeds
+    assert result["deep_capture_probe"]["checked"] is True
+    assert result["deep_capture_probe"]["ok"] is probe_succeeds
+
+
 def _fake_page_capture(title: str, *, url: str = "https://www.jd.com/") -> _FakeCaptureDesktop:
     class PageCaptureDesktop(_FakeCaptureDesktop):
         def call(self, service, method, args=None):
@@ -4514,6 +5200,73 @@ def test_extension_runtime_preflight_accepts_matching_current_page(monkeypatch):
     assert result["document_found"] is True
     assert result["identity"] == {"title_match": True, "url_match": True, "changed": False}
     assert result["chrome_session"]["reused"] is True
+
+
+def test_chrome_window_focus_reports_unknown_target_without_a_title(monkeypatch):
+    """A URL alone cannot be tied to a Win32 window, so it must not pass."""
+    monkeypatch.setattr(extension_bridge, "_enum_windows", lambda: pytest.fail("must not enumerate"))
+
+    result = extension_bridge.check_chrome_window_focus(
+        expected_title="", expected_url="https://search.test/results"
+    )
+
+    assert result["focused"] is False
+    assert result["reason"] == "target_window_unknown"
+
+
+def test_chrome_window_focus_accepts_foreground_target(monkeypatch):
+    monkeypatch.setattr(extension_bridge, "_enum_windows", lambda: [(11, "手机 - 商品搜索 - 京东 - Google Chrome")])
+    monkeypatch.setattr(extension_bridge, "_foreground_window_id", lambda: 11)
+    monkeypatch.setattr(extension_bridge, "_activate_window", lambda hwnd: pytest.fail("already focused"))
+
+    result = extension_bridge.check_chrome_window_focus(expected_title="京东商品搜索")
+
+    assert result["focused"] is True
+    assert result["reason"] == "focused"
+    assert result["hwnd"] == 11
+    assert result["activated"] is False
+
+
+def test_chrome_window_focus_activates_then_confirms_target(monkeypatch):
+    foreground = {"hwnd": 99}
+    monkeypatch.setattr(extension_bridge, "_enum_windows", lambda: [(11, "京东 - Google Chrome")])
+    monkeypatch.setattr(extension_bridge, "_foreground_window_id", lambda: foreground["hwnd"])
+    monkeypatch.setattr(extension_bridge, "_win32_window_text", lambda hwnd: f"window-{hwnd}")
+
+    def activate(hwnd):
+        foreground["hwnd"] = hwnd
+        return True
+
+    monkeypatch.setattr(extension_bridge, "_activate_window", activate)
+
+    result = extension_bridge.check_chrome_window_focus(expected_title="京东")
+
+    assert result["focused"] is True
+    assert result["activated"] is True
+    assert result["reason"] == "focused"
+
+
+def test_chrome_window_focus_blocks_when_activation_is_refused(monkeypatch):
+    monkeypatch.setattr(extension_bridge, "_enum_windows", lambda: [(11, "京东 - Google Chrome")])
+    monkeypatch.setattr(extension_bridge, "_foreground_window_id", lambda: 99)
+    monkeypatch.setattr(extension_bridge, "_win32_window_text", lambda hwnd: f"window-{hwnd}")
+    monkeypatch.setattr(extension_bridge, "_activate_window", lambda hwnd: False)
+
+    result = extension_bridge.check_chrome_window_focus(expected_title="京东")
+
+    assert result["focused"] is False
+    assert result["reason"] == "window_focus_unverified"
+    assert result["foreground_hwnd"] == 99
+    assert result["foreground_title"] == "window-99"
+
+
+def test_chrome_window_focus_reports_missing_chrome(monkeypatch):
+    monkeypatch.setattr(extension_bridge, "_enum_windows", lambda: [])
+
+    result = extension_bridge.check_chrome_window_focus(expected_title="京东")
+
+    assert result["focused"] is False
+    assert result["reason"] == "chrome_not_found"
 
 
 def test_extension_runtime_preflight_accepts_search_title_drift_when_url_matches(monkeypatch):
@@ -4818,6 +5571,88 @@ def test_extension_scan_page_targeted_search_stops_before_full_document_scan(mon
     assert result["candidates"][0]["element_id"] == "uia:search"
 
 
+def test_extension_targeted_search_uses_requested_window_without_relisting(monkeypatch):
+    class TargetedDesktop(_FakeCaptureDesktop):
+        def call(self, service, method, args=None):
+            self.calls.append((service, method, args or []))
+            if method == "getDeepCaptureElementChildrenById":
+                parent_id = str((args or [""])[0])
+                descendants = {
+                    "wnd:1": [{"elementId": "uia:document", "name": "Document", "tag": "文档", "type": "6"}],
+                    "uia:document": [
+                        {
+                            "elementId": "uia:search",
+                            "name": "搜索",
+                            "placeholder": "搜索商品",
+                            "tag": "编辑",
+                            "type": "6",
+                        }
+                    ],
+                }.get(parent_id, [])
+                return {"isSuccess": True, "data": {"elementId": parent_id, "descendants": descendants, "code": 0}}
+            return {"isSuccess": True, "data": {"code": 0}}
+
+    bridge = ShizaiExtensionBridge(desktop=TargetedDesktop())
+    monkeypatch.setattr(bridge, "capture_windows", lambda **_kwargs: pytest.fail("requested root must be reused"))
+    monkeypatch.setattr(bridge, "capture_tree", lambda *_args, **_kwargs: pytest.fail("targeted hit must not fall back"))
+
+    result = bridge.scan_page(
+        root_element_id="wnd:1",
+        query="搜索框",
+        strategy="auto",
+        max_nodes=20,
+    )
+
+    assert result["scan_strategy"] == "targeted"
+    assert result["root_element_id"] == "wnd:1"
+    assert result["candidates"][0]["element_id"] == "uia:search"
+
+
+def test_extension_targeted_search_reaches_document_with_shallow_requested_level(monkeypatch):
+    monkeypatch.setattr(extension_bridge, "_enum_windows", lambda: [(1, "京东 - Google Chrome")])
+
+    class DeepDocumentDesktop(_FakeCaptureDesktop):
+        def call(self, service, method, args=None):
+            self.calls.append((service, method, args or []))
+            if method != "getDeepCaptureElementChildrenById":
+                return {"isSuccess": True, "data": {"code": 0}}
+            parent_id = str((args or [""])[0])
+            if parent_id == "":
+                descendants = [{"elementId": "wnd:1", "name": "Chrome", "type": "32"}]
+            elif parent_id == "wnd:1":
+                descendants = [{"elementId": "uia:n1", "name": "container", "type": "32"}]
+            elif parent_id.startswith("uia:n"):
+                depth = int(parent_id.removeprefix("uia:n"))
+                descendants = (
+                    [{"elementId": "uia:document", "name": "Document", "tag": "文档", "type": "6"}]
+                    if depth == 7
+                    else [{"elementId": f"uia:n{depth + 1}", "name": "container", "type": "32"}]
+                )
+            elif parent_id == "uia:document":
+                descendants = [
+                    {
+                        "elementId": "uia:search",
+                        "name": "搜索",
+                        "placeholder": "搜索商品",
+                        "tag": "编辑",
+                        "type": "6",
+                    }
+                ]
+            else:
+                descendants = []
+            return {"isSuccess": True, "data": {"elementId": parent_id, "descendants": descendants, "code": 0}}
+
+    bridge = ShizaiExtensionBridge(desktop=DeepDocumentDesktop())
+    monkeypatch.setattr(bridge, "capture_tree", lambda *_args, **_kwargs: pytest.fail("targeted hit must not fall back"))
+
+    result = bridge.scan_page(query="搜索框", strategy="targeted", level=4, max_nodes=20)
+
+    assert result["scan_strategy"] == "targeted"
+    assert result["targeted_fallback"] is False
+    assert result["document_ids"] == ["uia:document"]
+    assert result["candidates"][0]["element_id"] == "uia:search"
+
+
 def test_extension_scan_page_targeted_search_falls_back_to_full_scan(monkeypatch):
     monkeypatch.setattr(extension_bridge, "_enum_windows", lambda: [(1, "京东 - Google Chrome")])
 
@@ -4853,6 +5688,87 @@ def test_extension_scan_page_targeted_search_falls_back_to_full_scan(monkeypatch
     assert result["scan_strategy"] == "full"
     assert result["targeted_fallback"] is True
     assert full_scans
+    assert result["document_ids"] == ["uia:document"]
+    assert result["candidate_count"] == 0
+    assert result["next_action"]["tool"] == "shizai_rpa_scan_page"
+    assert "Document" in result["message"]
+    assert result["selector_discovery"]["automatic_fallback"] is None
+
+
+def test_extension_scan_page_reports_full_strategy_when_fallback_finds_candidates(monkeypatch):
+    bridge = ShizaiExtensionBridge(desktop=_FakeCaptureDesktop())
+    monkeypatch.setattr(
+        bridge,
+        "_targeted_page_search",
+        lambda **_kwargs: {
+            "document_ids": [],
+            "inspected_roots": [],
+            "candidates": [],
+            "visible_text": [],
+            "nodes_visited": 8,
+            "rpc_calls": 3,
+            "elapsed_ms": 10,
+        },
+    )
+    monkeypatch.setattr(
+        bridge,
+        "capture_windows",
+        lambda **_kwargs: {"windows": [{"element_id": "wnd:1", "title": "京东 - Google Chrome"}]},
+    )
+
+    def capture_tree(element_id, *, level, max_nodes):
+        if element_id == "wnd:1":
+            return {
+                "descendants": [{"elementId": "uia:document", "name": "Document", "tag": "文档", "type": "6"}],
+                "count": 1,
+            }
+        return {
+            "descendants": [
+                {
+                    "elementId": "uia:search",
+                    "name": "搜索",
+                    "placeholder": "搜索商品",
+                    "tag": "编辑",
+                    "type": "6",
+                }
+            ],
+            "count": 1,
+        }
+
+    monkeypatch.setattr(bridge, "capture_tree", capture_tree)
+
+    result = bridge.scan_page(query="搜索框", strategy="auto", max_nodes=20)
+
+    assert result["candidate_count"] == 1
+    assert result["scan_strategy"] == "full"
+    assert result["targeted_fallback"] is True
+
+
+def test_extension_scan_page_routes_missing_document_to_automatic_component_fallback(monkeypatch):
+    monkeypatch.setattr(extension_bridge, "_enum_windows", lambda: [(1, "京东 - Google Chrome")])
+
+    class ShellOnlyDesktop(_FakeCaptureDesktop):
+        def call(self, service, method, args=None):
+            if method == "getDeepCaptureElementChildrenById":
+                self.calls.append((service, method, args or []))
+                parent_id = str((args or [""])[0])
+                descendants = (
+                    [{"elementId": "uia:pane", "name": "Chrome content", "type": "32"}]
+                    if parent_id == "wnd:1"
+                    else []
+                )
+                return {"isSuccess": True, "data": {"elementId": parent_id, "descendants": descendants}}
+            return super().call(service, method, args)
+
+    bridge = ShizaiExtensionBridge(desktop=ShellOnlyDesktop())
+
+    result = bridge.scan_page(root_element_id="wnd:1", query="搜索框", max_nodes=20)
+
+    assert result["document_ids"] == []
+    assert result["selector_discovery"]["automatic_available"] is False
+    assert result["selector_discovery"]["interactive_fallback"]["requires_user_click"] is True
+    assert result["next_action"]["tool"] == "shizai_rpa_component_catalog"
+    assert result["next_action"]["arguments"]["component_type"] == "WebBrowser_RunJsInIeBySelector_v3"
 
 
 def test_extension_start_capture_uses_designer_inspect_protocol():
@@ -5065,6 +5981,88 @@ def test_count_limited_collection_infers_pagination_mode_from_live_selector():
     assert paging["selector_page"].startswith("elementsFormatNew(")
 
 
+def test_collection_step_materializes_pagination_specific_page_scope(tmp_path):
+    paths = _paths(tmp_path)
+    native = _make_project(paths, "pagination-materialize")
+    (native / "szrpa.json").write_text(
+        json.dumps(
+            {
+                "packageName": "Pagination Materialize",
+                "mcpTargetUrl": "https://example.test/results",
+                "mcpRequiredColumns": ["商品名称"],
+                "mcpMaxRows": 100,
+                "mcpPlanningPolicy": "model_decides",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (native / "io5cd.task").write_text(
+        json.dumps(
+            {
+                "componentModelEntities": {
+                    "MAIN_COMPONENT": {
+                        "id": "MAIN_COMPONENT",
+                        "type": "main",
+                        "args0": [{"name": "statements", "value": []}],
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    records = [
+        {
+            "id": "product-name",
+            "name": "商品名称",
+            "title": "结果页",
+            "url": "https://example.test/results",
+            "tag": "span",
+            "css_selector": ".product-name",
+            "attributes": {"class": "product-name"},
+        },
+        {
+            "id": "next-page",
+            "name": "下一页",
+            "title": "结果页",
+            "url": "https://example.test/results",
+            "tag": "a",
+            "css_selector": ".next-page",
+            "attributes": {"class": "next-page"},
+        },
+    ]
+    project.import_elements(paths, str(native), records, capture_source="deep_capture")
+
+    project.add_rpa_step(
+        paths,
+        str(native),
+        "WebBrowser_DataCollectionV5",
+        step_id="collect",
+        element_ids=["product-name"],
+        config={
+            "columns": ["商品名称"],
+            "region": 3,
+            "collect_items": 100,
+            "page_type_num": 1,
+            "selector_page": "next-page",
+        },
+    )
+
+    task = json.loads((native / "io5cd.task").read_text(encoding="utf-8"))
+    args = {
+        item["name"]: item["value"]
+        for item in task["componentModelEntities"]["collect"]["args0"]
+    }
+    assert args["selector_page"] == (
+        'elementsFormatNew(SHIZAI_ELEMENT_DICT["mcp-page-scope"]["selector"])'
+    )
+    elements = json.loads((native / "elements.json").read_text(encoding="utf-8"))
+    scope = elements["elementMap"][project.MCP_PAGE_SCOPE_ELEMENT_ID]
+    assert scope["mcpPageScopeSource"] == "next-page"
+    assert scope["selector"]["selector"][-1]["props"][0]["value"] == '"next-page"'
+
+
 def test_collection_pagination_is_advisory_until_the_model_selects_a_mode():
     capability = project._collection_pagination_capability(
         {
@@ -5165,6 +6163,35 @@ def test_runtime_extension_status_prefers_enabled_mv3_and_live_native_host(monke
     old = next(item for item in result["extensions"] if item["id"] == old_id)
     assert old["enabled"] is False
     assert old["disable_reasons"] == [8388608]
+
+
+def test_runtime_extension_status_accepts_legacy_string_action(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    extension_id = "pcopnibgkbdnlaeagepigbboebdfejmb"
+    profile = tmp_path / "Google" / "Chrome" / "User Data" / "Default"
+    manifest_dir = profile / "Extensions" / extension_id / "4.0.1.235_0"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "Shizai Agent",
+                "version": "4.0.1.235",
+                "manifest_version": 3,
+                "action": "pages/popup.html",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (profile / "Secure Preferences").write_text(
+        json.dumps({"extensions": {"settings": {extension_id: {}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(extension_bridge, "_discover_native_host_processes", lambda: [])
+
+    result = extension_bridge._runtime_extension_status()
+
+    assert result["preferred_extension"]["id"] == extension_id
+    assert result["preferred_extension"]["popup"] is None
 
 
 def test_runtime_extension_status_explains_installed_but_disabled_mv3(monkeypatch, tmp_path):
@@ -5547,6 +6574,171 @@ def test_extension_scan_infers_product_title_merchant_and_numeric_price():
     assert "price" in by_id["uia:price"]["semantic_fields"]
 
 
+def test_extension_scan_treats_long_product_hyperlink_as_title_and_link():
+    nodes = [
+        {
+            "elementId": "uia:product-link",
+            "name": "联想拯救者Y9000P 2026款游戏笔记本电脑 16GB 1TB",
+            "tag": "超链接",
+            "props": [{"name": "href", "value": "https://item.example.test/123"}],
+        },
+        {"elementId": "uia:nav-link", "name": "游戏台式机", "tag": "超链接"},
+    ]
+
+    result = extension_bridge._scan_tree_nodes(
+        nodes,
+        query="",
+        max_nodes=20,
+        document_seen=True,
+        path=("Document", "组", "组", "组"),
+    )
+    by_id = {item["element_id"]: item for item in result}
+
+    assert {"product_name", "link"}.issubset(by_id["uia:product-link"]["semantic_fields"])
+    assert "product_name" not in by_id["uia:nav-link"]["semantic_fields"]
+
+
+def test_extension_scan_recognizes_flat_long_product_text_without_card_ancestry():
+    nodes = [
+        {
+            "elementId": "uia:flat-product-title",
+            "name": "惠普战99 2026酷睿版高性能设计师笔记本电脑",
+            "tag": "文本",
+        },
+        {"elementId": "uia:flat-footer", "name": "京东消费者权益保护说明", "tag": "文本"},
+    ]
+
+    result = extension_bridge._scan_tree_nodes(
+        nodes,
+        query="",
+        max_nodes=20,
+        document_seen=True,
+        path=("Document",),
+    )
+    by_id = {item["element_id"]: item for item in result}
+
+    assert "product_name" in by_id["uia:flat-product-title"]["semantic_fields"]
+    assert "product_name" not in by_id["uia:flat-footer"]["semantic_fields"]
+
+
+def test_extension_scan_groups_classless_article_fields_by_card_instance():
+    nodes = [
+        {
+            "elementId": "uia:article-1",
+            "name": "",
+            "tag": "文章",
+            "children": [
+                {"elementId": "uia:title-1", "name": "测评手机1号", "tag": "文本"},
+                {"elementId": "uia:price-1", "name": "2880", "tag": "文本"},
+                {"elementId": "uia:sales-1", "name": "已售 437 件", "tag": "文本"},
+            ],
+        },
+        {
+            "elementId": "uia:article-2",
+            "name": "",
+            "tag": "文章",
+            "children": [
+                {"elementId": "uia:title-2", "name": "测评手机2号", "tag": "文本"},
+                {"elementId": "uia:price-2", "name": "2730", "tag": "文本"},
+                {"elementId": "uia:sales-2", "name": "已售 93 件", "tag": "文本"},
+            ],
+        },
+    ]
+
+    result = extension_bridge._scan_tree_nodes(
+        nodes,
+        query="",
+        max_nodes=20,
+        document_seen=True,
+        path=("Document",),
+    )
+    by_id = {item["element_id"]: item for item in result}
+    first = by_id["uia:title-1"]["card_context"]
+    second = by_id["uia:title-2"]["card_context"]
+
+    assert first["family_key"] == second["family_key"] == "semantic:article"
+    assert first["instance_key"] == "semantic:article|element_id=uia:article-1"
+    assert second["instance_key"] == "semantic:article|element_id=uia:article-2"
+    assert by_id["uia:price-1"]["card_context"]["instance_key"] == first["instance_key"]
+    assert by_id["uia:sales-1"]["card_context"]["instance_key"] == first["instance_key"]
+
+
+def test_extension_atomic_capture_pairs_classless_article_labels_with_values(monkeypatch):
+    nodes = [
+        {
+            "elementId": "uia:article-1",
+            "name": "",
+            "tag": "文章",
+            "children": [
+                {"elementId": "uia:id-label", "name": "商品编号", "tag": "文本"},
+                {"elementId": "uia:id-value", "name": "P001", "tag": "文本"},
+                {"elementId": "uia:name-label", "name": "商品名称", "tag": "文本"},
+                {"elementId": "uia:name-value", "name": "测评手机1号", "tag": "文本"},
+                {"elementId": "uia:price-label", "name": "价格", "tag": "文本"},
+                {"elementId": "uia:price-value", "name": "2880", "tag": "文本"},
+                {"elementId": "uia:sales-label", "name": "销量原文", "tag": "文本"},
+                {"elementId": "uia:sales-value", "name": "已售 437 件", "tag": "文本"},
+                {"elementId": "uia:metric-label", "name": "指标口径", "tag": "文本"},
+                {"elementId": "uia:metric-value", "name": "累计销量", "tag": "文本"},
+                {"elementId": "uia:link-label", "name": "商品链接", "tag": "文本"},
+                {"elementId": "uia:link-space", "name": " ", "tag": "文本"},
+                {"elementId": "uia:link-value", "name": "查看商品", "tag": "链接"},
+            ],
+        }
+    ]
+    candidates = extension_bridge._scan_tree_nodes(
+        nodes,
+        query="",
+        max_nodes=30,
+        document_seen=True,
+        path=("Document",),
+    )
+    by_id = {item["element_id"]: item for item in candidates}
+    assert "product_name" not in by_id["uia:name-label"]["semantic_fields"]
+    assert "sales_metric" not in by_id["uia:metric-label"]["semantic_fields"]
+
+    bridge = ShizaiExtensionBridge(desktop=object())
+    monkeypatch.setattr(
+        bridge,
+        "scan_page",
+        lambda **_kwargs: {
+            "capture_ready": True,
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "page_title": "组件测评商城",
+            "page_url": "https://example.test/shop",
+        },
+    )
+    monkeypatch.setattr(
+        bridge,
+        "capture_element",
+        lambda element_id, **_kwargs: {
+            "record": {
+                "id": element_id,
+                "name": element_id,
+                "card_context": None,
+                "link_context": {"is_link": element_id == "uia:link-value"},
+            }
+        },
+    )
+
+    result = bridge.capture_page_fields(
+        fields=["product_id", "product_name", "price", "sales", "sales_metric", "link"],
+        candidate_limit=4,
+    )
+
+    assert result["complete"] is True
+    assert result["selected_field_ids"] == {
+        "product_id": "uia:id-value",
+        "product_name": "uia:name-value",
+        "price": "uia:price-value",
+        "sales": "uia:sales-value",
+        "sales_metric": "uia:metric-value",
+        "link": "uia:link-value",
+    }
+    assert result["selected_card_grouping"] == "instance"
+
+
 def test_extension_scan_uses_accessible_property_for_jd_self_operated_merchant():
     nodes = [
         {
@@ -5698,7 +6890,13 @@ def test_extension_atomic_capture_expands_only_missing_field_until_same_card_is_
             "text": "示例自营旗舰店",
         },
         {"element_id": "price-a", "semantic_fields": ["price"], "semantic_score": 8, "scan_order": 3, "text": "4099"},
-        {"element_id": "link-a", "semantic_fields": ["link"], "semantic_score": 8, "scan_order": 4, "text": "详情"},
+        {
+            "element_id": "link-a",
+            "semantic_fields": ["product_name", "link"],
+            "semantic_score": 8,
+            "scan_order": 4,
+            "text": "详情",
+        },
         {
             "element_id": "sales-b",
             "semantic_fields": ["sales"],
@@ -5741,7 +6939,7 @@ def test_extension_atomic_capture_expands_only_missing_field_until_same_card_is_
                 "id": element_id,
                 "name": field,
                 "card_context": {"key": card_by_id[element_id]},
-                "link_context": {},
+                "link_context": {"is_link": element_id == "link-a"},
             }
         }
 
@@ -5764,6 +6962,138 @@ def test_extension_atomic_capture_expands_only_missing_field_until_same_card_is_
     assert "sales-a" in captured_ids
 
 
+def test_extension_atomic_capture_stops_batch_after_transient_channel_error(monkeypatch):
+    bridge = ShizaiExtensionBridge(desktop=object())
+    candidates = [
+        {
+            "element_id": f"{field}-a",
+            "semantic_fields": [field],
+            "semantic_score": 8,
+            "scan_order": index,
+            "text": field,
+            "card_context": {"key": "card-a", "instance_key": "card-a", "family_key": "card"},
+        }
+        for index, field in enumerate(("product_name", "price", "sales", "link"), 1)
+    ]
+    monkeypatch.setattr(
+        bridge,
+        "scan_page",
+        lambda **_kwargs: {
+            "kind": "shizai_page_element_candidates",
+            "capture_ready": True,
+            "candidate_count": 100,
+            "candidates": candidates,
+            "page_title": "结果页",
+            "page_url": "https://example.test/results",
+        },
+    )
+    captured_ids = []
+
+    def unavailable(element_id, **_kwargs):
+        captured_ids.append(element_id)
+        raise ShizaiCloudError("reason=channel_unavailable")
+
+    monkeypatch.setattr(bridge, "capture_element", unavailable)
+
+    result = bridge.capture_page_fields(fields=["product_name", "price", "sales", "link"])
+
+    assert len(captured_ids) == 1
+    assert result["complete"] is False
+    assert len(result["capture_errors"]) == 1
+    assert "channel_unavailable" in result["capture_errors"][0]["error"]
+
+
+def test_extension_atomic_capture_probes_each_field_before_widening(monkeypatch):
+    bridge = ShizaiExtensionBridge(desktop=object())
+    candidates = [
+        {
+            "element_id": f"{field}-{offset}",
+            "semantic_fields": [field],
+            "semantic_score": 8 - offset,
+            "scan_order": offset * 10 + field_index,
+            "text": field,
+            "card_context": {"key": "card-a", "instance_key": "card-a", "family_key": "card"},
+        }
+        for offset in range(2)
+        for field_index, field in enumerate(("product_name", "price", "sales"), 1)
+    ]
+    monkeypatch.setattr(
+        bridge,
+        "scan_page",
+        lambda **_kwargs: {
+            "capture_ready": True,
+            "candidate_count": 100,
+            "candidates": candidates,
+            "page_title": "Results",
+            "page_url": "https://example.test/results",
+        },
+    )
+    captured_ids = []
+
+    def capture(element_id, **_kwargs):
+        captured_ids.append(element_id)
+        if len(captured_ids) == 4:
+            raise ShizaiCloudError("reason=channel_unavailable")
+        field = element_id.rsplit("-", 1)[0]
+        return {"record": {"id": element_id, "name": field, "card_context": {"key": "card-a"}}}
+
+    monkeypatch.setattr(bridge, "capture_element", capture)
+
+    result = bridge.capture_page_fields(fields=["product_name", "price", "sales"], candidate_limit=2)
+
+    assert captured_ids == ["product_name-0", "price-0", "sales-0"]
+    assert result["complete"] is True
+    assert result["capture_errors_blocking"] is False
+    assert result["quality_warning"] is None
+
+
+def test_extension_atomic_capture_uses_same_snapshot_card_hint_when_selector_omits_ancestor(monkeypatch):
+    bridge = ShizaiExtensionBridge(desktop=object())
+    context = {
+        "key": "goods-card|@index=0",
+        "instance_key": "goods-card|@index=0",
+        "family_key": "goods-card",
+        "class": "goods-card",
+        "index": "0",
+        "source": "tree_hint",
+    }
+    candidates = [
+        {
+            "element_id": field,
+            "semantic_fields": [field],
+            "semantic_score": 8,
+            "scan_order": index,
+            "text": field,
+            "card_context": context,
+        }
+        for index, field in enumerate(("product_name", "price", "sales"), 1)
+    ]
+    monkeypatch.setattr(
+        bridge,
+        "scan_page",
+        lambda **_kwargs: {
+            "capture_ready": True,
+            "candidate_count": 100,
+            "candidates": candidates,
+            "page_title": "Results",
+            "page_url": "https://example.test/results",
+        },
+    )
+    monkeypatch.setattr(
+        bridge,
+        "capture_element",
+        lambda element_id, **_kwargs: {
+            "record": {"id": element_id, "name": element_id, "card_context": None, "link_context": {}}
+        },
+    )
+
+    result = bridge.capture_page_fields(fields=["product_name", "price", "sales"])
+
+    assert result["complete"] is True
+    assert result["selected_card_context"] == "goods-card|@index=0"
+    assert all(record["card_context_source"] == "same_snapshot_tree_hint" for record in result["elements"])
+
+
 def test_extension_element_marks_customer_service_selector_as_link_noise():
     selector = {
         "commonProps": {"GUIType": "Chrome", "processName": "chrome.exe"},
@@ -5779,6 +7109,20 @@ def test_extension_element_marks_customer_service_selector_as_link_noise():
     record = _element_record("uia:customer", {"elementAlias": "Hyperlink"}, selector)
     assert record["link_context"]["is_link"] is True
     assert record["link_context"]["service_or_navigation"] is True
+
+
+def test_workflow_reference_requires_matching_live_site_evidence():
+    context = {"marker": "plugingoodscardwrapper", "class": "plugin_goodsCardWrapper"}
+
+    assert workflow_references.match_product_link_reference("https://search.jd.com/Search") == (
+        workflow_references.JD_PRODUCT_LINK_REFERENCE
+    )
+    assert workflow_references.match_product_link_reference(
+        "", page_title="电脑 - 商品搜索 - 京东 - Google Chrome", card_context=context
+    ) == workflow_references.JD_PRODUCT_LINK_REFERENCE
+    assert workflow_references.match_product_link_reference(
+        "", page_title="商品搜索 - Example", card_context=context
+    ) is None
 
 
 def test_collection_binding_rejects_customer_service_link_and_cross_card_mix():
@@ -5868,6 +7212,435 @@ def test_collection_selector_converts_uia_chain_to_web_chain():
     assert project._has_collection_selector(converted) is True
 
 
+def test_collection_selector_preserves_table_row_and_cell_semantics():
+    element = {
+        "selector": {
+            "selector": [
+                {"name": "tab", "props": []},
+                {"name": "table", "type": "web", "props": [{"name": "@index", "value": "3"}]},
+                {"name": "div", "type": "web", "props": [{"name": "@index", "value": "1"}]},
+                {
+                    "name": "div",
+                    "type": "web",
+                    "props": [
+                        {"name": "name", "value": '"P001"'},
+                        {"name": "@index", "value": "0"},
+                    ],
+                },
+            ]
+        },
+        "mcpNativeSelector": {
+            "selector": [
+                {"name": "Window", "type": "32", "props": []},
+                {"name": "Document", "type": "6", "props": []},
+                {"name": "Table", "type": "6", "props": [{"name": "@index", "value": "3"}]},
+                {"name": "DataItem", "type": "6", "props": [{"name": "@index", "value": "1"}]},
+                {
+                    "name": "DataItem",
+                    "type": "6",
+                    "props": [
+                        {"name": "name", "value": '"P001"'},
+                        {"name": "@index", "value": "0"},
+                    ],
+                },
+            ]
+        },
+    }
+
+    converted = project._collection_selector_chain(element)
+
+    assert converted is not None
+    assert [item["name"] for item in converted] == ["table", "tr", "td"]
+    assert not any(prop["name"] == "name" for item in converted for prop in item["props"])
+    assert project._has_collection_selector(converted) is True
+
+
+def test_collection_config_uses_repeating_rows_for_native_table_cells():
+    def table_cell(element_id: str, cell_index: int, *, link: bool = False) -> dict[str, object]:
+        native_chain = [
+            {"name": "Window", "type": "32", "props": []},
+            {"name": "Document", "type": "6", "props": []},
+            {"name": "Table", "type": "6", "props": [{"name": "@index", "value": "3"}]},
+            {"name": "DataItem", "type": "6", "props": [{"name": "@index", "value": "1"}]},
+            {
+                "name": "DataItem",
+                "type": "6",
+                "props": [{"name": "@index", "value": str(cell_index)}],
+            },
+        ]
+        if link:
+            native_chain.append(
+                {
+                    "name": "Hyperlink",
+                    "type": "6",
+                    "props": [
+                        {"name": "name", "value": '"查看商品"'},
+                        {"name": "@index", "value": "0"},
+                    ],
+                }
+            )
+        return {
+            "id": element_id,
+            "mcpNativeSelector": {
+                "selector": native_chain
+            },
+            "selector": {
+                "selector": [
+                    {"name": "table", "type": "web", "props": [{"name": "@index", "value": "3"}]},
+                    {"name": "div", "type": "web", "props": [{"name": "@index", "value": "1"}]},
+                    {"name": "div", "type": "web", "props": [{"name": "@index", "value": str(cell_index)}]},
+                ]
+            },
+        }
+
+    config, count = project._staged_collection_config(
+        {"elementMap": {"name": table_cell("name", 1), "link": table_cell("link", 5, link=True)}},
+        ["name", "link"],
+        keyword="手机",
+        columns=["商品名称", "商品链接"],
+        fallback_page_url="https://example.test/shop",
+    )
+
+    assert count == 2
+    assert config is not None
+    collection = config["collectionConfig"]
+    assert collection["tableSelector"] == [
+        {"name": "table", "type": "web", "accurate": "true", "props": []}
+    ]
+    assert [item["defaultColumnIndex"] for item in collection["columnConfigArray"]] == [1, 5]
+    assert collection["columnSelectorArray"][0][0]["props"][0]["value"] == "td:nth-child(2)"
+    assert collection["columnSelectorArray"][1][0]["props"][0]["value"] == "td:nth-child(6)"
+    assert collection["columnConfigArray"][1]["dataAttrName"] == "href"
+
+
+def test_collection_config_recovers_table_cells_from_legacy_converted_native_chain():
+    def table_cell(element_id: str, cell_index: int, *, is_link: bool = False) -> dict[str, object]:
+        native_selector = [
+            {"name": "tab", "props": []},
+            {"name": "table", "type": "web", "props": [{"name": "@index", "value": "3"}]},
+            {"name": "div", "type": "web", "props": [{"name": "@index", "value": "1"}]},
+            {"name": "div", "type": "web", "props": [{"name": "@index", "value": str(cell_index)}]},
+        ]
+        if is_link:
+            native_selector.append(
+                {"name": "a", "type": "web", "props": [{"name": "@index", "value": "0"}]}
+            )
+        return {
+            "id": element_id,
+            "mcpNativeSelector": {"selector": native_selector},
+            "selector": {
+                "selector": [
+                    {"name": "tab", "props": []},
+                    {"name": "div", "type": "web", "props": [{"name": "innertext", "value": element_id}]},
+                ]
+            },
+        }
+
+    config, count = project._staged_collection_config(
+        {"elementMap": {"id": table_cell("P001", 0), "link": table_cell("查看商品", 5, is_link=True)}},
+        ["id", "link"],
+        keyword="手机",
+        columns=["商品编号", "商品链接"],
+    )
+
+    assert count == 2
+    assert config is not None
+    collection = config["collectionConfig"]
+    assert collection["tableSelector"] == [
+        {"name": "table", "type": "web", "accurate": "true", "props": []}
+    ]
+    assert [item["defaultColumnIndex"] for item in collection["columnConfigArray"]] == [0, 5]
+    assert collection["columnSelectorArray"][0][0]["props"][0]["value"] == "td:nth-child(1)"
+    assert collection["columnSelectorArray"][1][0]["props"][0]["value"] == "td:nth-child(6)"
+    assert collection["columnConfigArray"][1]["dataAttrName"] == "href"
+
+
+def test_collection_binding_rejects_table_cell_used_as_product_link():
+    issues = project._collection_binding_diagnostics(
+        {
+            "elementMap": {
+                "id": {"link_context": {"is_link": False}},
+                "link": {"link_context": {"is_link": False}},
+            }
+        },
+        ["id", "link"],
+        ["商品编号", "商品链接"],
+    )
+
+    assert issues == [
+        {
+            "check": "product_link_selector",
+            "message": "元素 link 不是原生链接控件；请捕获单元格内的 Hyperlink/链接子节点。",
+        }
+    ]
+
+
+def test_collection_binding_rejects_inferred_uia_card_dom_path():
+    issues = project._collection_binding_diagnostics(
+        {
+            "elementMap": {
+                "name": {
+                    "mcpCaptureSource": "deep_capture",
+                    "card_context": {
+                        "family_key": "semantic:article",
+                        "semantic_container": "article",
+                    },
+                    "selector": {
+                        "commonProps": {"cssSelector": "", "xpathSelector": ""},
+                        "selector": [
+                            {"name": "Window", "type": "32", "props": []},
+                            {"name": "Document", "type": "6", "props": []},
+                            {"name": "Group", "type": "6", "props": [{"name": "@index", "value": "3"}]},
+                            {"name": "Text", "type": "6", "props": [{"name": "@index", "value": "1"}]},
+                        ],
+                    },
+                }
+            }
+        },
+        ["name"],
+        ["商品名称"],
+    )
+
+    assert issues == [
+        {
+            "check": "native_collection_dom_selector",
+            "message": (
+                "以下采集字段只有 Chrome UIA 路径，不能可靠推导网页 DOM 标签：商品名称。"
+                "请用原生数据采集拾取/预览生成网页 selector，或使用带真实 CSS/XPath 证据的通用预处理后重新绑定；"
+                "禁止把 Group/Text 猜成 div/span。"
+            ),
+        }
+    ]
+
+
+def test_collection_binding_allows_real_web_selector_for_card_field():
+    issues = project._collection_binding_diagnostics(
+        {
+            "elementMap": {
+                "name": {
+                    "selector": {
+                        "commonProps": {"cssSelector": ".product-card .product-name"},
+                        "selector": [
+                            {
+                                "name": "span",
+                                "type": "web",
+                                "props": [{"name": "class", "value": "product-name"}],
+                            }
+                        ],
+                    }
+                }
+            }
+        },
+        ["name"],
+        ["商品名称"],
+    )
+
+    assert issues == []
+
+
+def test_native_collection_preview_uses_json_params_and_counts_data_rows(tmp_path):
+    paths = _paths(tmp_path)
+    native = paths.applications_root / "preview-native"
+    native.mkdir(parents=True)
+    config = {
+        "pageInfo": {
+            "windowTitle": "商品页",
+            "pageUrl": "https://example.test/products",
+            "windowType": "web",
+            "processName": "",
+        },
+        "collectionConfig": {
+            "tableSelector": [{"name": "table", "type": "web", "props": []}],
+            "columnSelectorArray": [[{"name": "td", "type": "web", "props": []}]],
+            "columnConfigArray": [{"columnHeader": "商品名称", "dataAttrName": "innerText"}],
+            "mergeConfigMap": {},
+            "commonSelector": [{"name": "body", "type": "web", "props": []}],
+            "scrollVerticalDelay": 250,
+            "scrollMaxTotalDelay": 1000,
+            "selectorVersion": "1.4",
+            "scrollType": 1,
+        },
+    }
+    (native / "io5cd.task").write_text(
+        json.dumps(
+            {
+                "componentModelEntities": {
+                    "MAIN_COMPONENT": {
+                        "id": "MAIN_COMPONENT",
+                        "type": "main",
+                        "args0": [{"name": "statements", "value": ["collect"]}],
+                    },
+                    "collect": {
+                        "id": "collect",
+                        "type": "WebBrowser_DataCollectionV5",
+                        "args0": [{"name": "config", "value": json.dumps(config, ensure_ascii=False)}],
+                    },
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class Client:
+        def call(self, service, method, args):
+            assert (service, method) == ("DataCollectService", "dataCollectCapturePreview")
+            native_params = json.loads(args[0]["jsonParams"])
+            assert native_params["colorGuidanceConfig"]["actionCmd"] == "preview"
+            assert native_params["dataCollectConfig"]["pageInfo"]["windowTitle"] == "商品页"
+            preview_config = native_params["dataCollectConfig"]["collectionConfig"]
+            assert preview_config["commonSelector"] == [{"name": "body", "type": "web", "props": []}]
+            assert preview_config["scrollVerticalDelay"] == 250
+            assert preview_config["scrollMaxTotalDelay"] == 1000
+            assert preview_config["scrollType"] == 1
+            return {"isSuccess": True, "data": [["商品名称"], ["手机 A"], ["手机 B"]]}
+
+    preview = project.preview_rpa_collection(paths, str(native), "collect", client=Client(), sample_limit=1)
+
+    assert preview["valid"] is True
+    assert preview["headers"] == ["商品名称"]
+    assert preview["data_row_count"] == 2
+    assert preview["sample_rows"] == [["手机 A"]]
+    assert preview["failure_kind"] is None
+
+
+def test_native_collection_preview_rejects_collapsed_columns(tmp_path):
+    paths = _paths(tmp_path)
+    native = paths.applications_root / "preview-collapsed"
+    native.mkdir(parents=True)
+    config = {
+        "pageInfo": {"windowTitle": "商品页", "pageUrl": "https://example.test/products"},
+        "collectionConfig": {
+            "tableSelector": [],
+            "columnSelectorArray": [
+                [{"name": "span", "type": "web", "props": []}],
+                [{"name": "span", "type": "web", "props": []}],
+                [{"name": "span", "type": "web", "props": []}],
+            ],
+            "columnConfigArray": [
+                {"columnHeader": "商品名称", "dataAttrName": "innerText"},
+                {"columnHeader": "价格", "dataAttrName": "innerText"},
+                {"columnHeader": "热度原文", "dataAttrName": "innerText"},
+            ],
+            "mergeConfigMap": {},
+            "selectorVersion": "1.4",
+        },
+    }
+    (native / "io5cd.task").write_text(
+        json.dumps(
+            {
+                "componentModelEntities": {
+                    "MAIN_COMPONENT": {
+                        "id": "MAIN_COMPONENT",
+                        "type": "main",
+                        "args0": [{"name": "statements", "value": ["collect"]}],
+                    },
+                    "collect": {
+                        "id": "collect",
+                        "type": "WebBrowser_DataCollectionV5",
+                        "args0": [{"name": "config", "value": json.dumps(config, ensure_ascii=False)}],
+                    },
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class Client:
+        def call(self, service, method, args):
+            assert (service, method) == ("DataCollectService", "dataCollectCapturePreview")
+            return {
+                "isSuccess": True,
+                "data": [
+                    ["商品名称", "价格", "热度原文"],
+                    ["上传图片搜索", "上传图片搜索", "上传图片搜索"],
+                    ["iphone17pro", "iphone17pro", "iphone17pro"],
+                ],
+            }
+
+    preview = project.preview_rpa_collection(paths, str(native), "collect", client=Client())
+
+    assert preview["valid"] is False
+    assert preview["data_row_count"] == 2
+    assert preview["failure_kind"] == "column_collapse"
+    assert "完全相同" in preview["message"]
+
+
+def test_collection_runtime_rejects_href_in_native_table_mode():
+    issues = project._collection_runtime_capability_diagnostics(
+        {
+            "tableSelector": [{"name": "table", "type": "web", "props": []}],
+            "columnConfigArray": [
+                {"columnHeader": "商品编号", "dataAttrName": "innerText"},
+                {"columnHeader": "商品链接", "dataAttrName": "href"},
+            ],
+        },
+        ["商品编号", "商品链接"],
+    )
+
+    assert issues == [
+        {
+            "check": "native_table_nested_link_attribute",
+            "message": (
+                "当前 RuntimeHost 的 DataCollectionV5 表格模式按列读取单元格文本，不能读取单元格内链接的 href；"
+                "不要继续重试列 selector。请依据当前页面捕获证据选择通用网页预处理、非表格采集模式或其他已安装组件，"
+                "并在运行后验证该列为真实 URL。"
+            ),
+        }
+    ]
+
+
+def test_collection_runtime_allows_href_outside_native_table_mode():
+    assert project._collection_runtime_capability_diagnostics(
+        {
+            "tableSelector": [],
+            "columnConfigArray": [{"columnHeader": "商品链接", "dataAttrName": "href"}],
+        },
+        ["商品链接"],
+    ) == []
+
+
+def test_collection_selector_accepts_relative_native_table_link_path():
+    selector = [
+        {"name": "tr", "type": "web", "props": []},
+        {"name": "td", "type": "web", "props": [{"name": "@index", "value": "5"}]},
+        {"name": "a", "type": "web", "props": [{"name": "@index", "value": "0"}]},
+    ]
+
+    assert project._has_collection_selector(selector) is True
+
+
+def test_collection_selector_uses_classless_article_as_repeat_scope():
+    element = {
+        "card_context": {"family_key": "semantic:article", "semantic_container": "article"},
+        "selector": {
+            "selector": [
+                {"name": "Window", "type": "32", "props": []},
+                {"name": "Document", "type": "6", "props": []},
+                {"name": "Group", "type": "6", "props": [{"name": "@index", "value": "3"}]},
+                {"name": "Group", "type": "6", "props": [{"name": "@index", "value": "2"}]},
+                {
+                    "name": "Text",
+                    "type": "6",
+                    "props": [
+                        {"name": "name", "value": '"2880"'},
+                        {"name": "@index", "value": "1"},
+                    ],
+                },
+            ]
+        },
+    }
+
+    converted = project._collection_selector_chain(element)
+
+    assert converted is not None
+    assert [item["name"] for item in converted] == ["article", "div", "span"]
+    assert converted[0]["props"] == []
+    assert converted[1]["props"][0]["textValue"] == 2
+    assert project._has_collection_selector(converted) is True
+
+
 def test_collection_selector_keeps_web_chain_and_uses_css_fallback():
     element = {
         "selector": {
@@ -5883,6 +7656,131 @@ def test_collection_selector_keeps_web_chain_and_uses_css_fallback():
     assert [item["name"] for item in converted] == ["span"]
     assert converted[0]["props"][-1]["name"] == "class"
     assert converted[0]["props"][-1]["textValue"] == "goods-title"
+
+
+def test_collection_selector_prefers_captured_css_over_long_index_chain():
+    element = {
+        "selector": {
+            "commonProps": {"cssSelector": json.dumps("div.goods-title span")},
+            "selector": [
+                {"name": "tab", "props": []},
+                {"name": "div", "type": "web", "props": [{"name": "class", "value": "goods-card"}]},
+                {"name": "div", "type": "web", "props": [{"name": "@index", "value": "0"}]},
+                {"name": "div", "type": "web", "props": [{"name": "@index", "value": "1"}]},
+                {"name": "span", "type": "web", "props": [{"name": "@index", "value": "0"}]},
+            ],
+        },
+        "card_context": {"family_key": "goods-card"},
+    }
+
+    converted = project._collection_selector_chain(element)
+
+    assert converted is not None
+    assert [item["name"] for item in converted] == ["div", "span"]
+    assert converted[0]["props"][0]["name"] == "class"
+    assert converted[0]["props"][0]["value"] == "goods-title"
+    assert converted[1]["props"] == []
+
+
+def test_collection_config_uses_generic_page_fallback_without_site_assumptions():
+    element = {
+        "selector": {
+            "commonProps": {"cssSelector": json.dumps(".product-name")},
+            "selector": [
+                {
+                    "name": "span",
+                    "type": "web",
+                    "props": [{"name": "class", "value": "product-name"}],
+                }
+            ],
+        }
+    }
+    config, count = project._staged_collection_config(
+        {"elementMap": {"name": element}},
+        ["name"],
+        keyword="手机",
+        columns=["商品名称"],
+        fallback_page_url="https://example.test/results?q=phone",
+        fallback_page_title="商品结果页",
+    )
+
+    assert count == 1
+    assert config is not None
+    assert config["pageInfo"] == {
+        "windowTitle": "商品结果页",
+        "pageUrl": "https://example.test/results?q=phone",
+        "windowType": "web",
+        "processName": "",
+    }
+
+
+def test_collection_config_normalizes_browser_shell_title_for_page_info():
+    element = {
+        "page_title": "组件测评商城 - Google Chrome",
+        "page_url": "http://127.0.0.1:18766/shop?seed=31",
+        "selector": {
+            "commonProps": {"cssSelector": json.dumps(".product-name")},
+            "selector": [
+                {
+                    "name": "span",
+                    "type": "web",
+                    "props": [{"name": "class", "value": "product-name"}],
+                }
+            ],
+        },
+    }
+
+    config, count = project._staged_collection_config(
+        {"elementMap": {"name": element}},
+        ["name"],
+        keyword="手机",
+        columns=["商品名称"],
+    )
+
+    assert count == 1
+    assert config is not None
+    assert config["pageInfo"]["windowTitle"] == "组件测评商城"
+
+
+def test_collection_config_prefers_selector_identity_over_stale_capture_window():
+    element = {
+        "page_title": "要恢复页面吗？",
+        "page_url": "http://127.0.0.1:18766/shop?layout=cards&seed=45",
+        "selector": {
+            "commonProps": {"cssSelector": json.dumps(".product-name")},
+            "selector": [
+                {
+                    "name": "Window",
+                    "type": "32",
+                    "props": [
+                        {
+                            "name": "title",
+                            "value": '"组件测评商城 - Google Chrome"',
+                            "textValue": "组件测评商城 - Google Chrome",
+                        }
+                    ],
+                },
+                {"name": "Document", "type": "6", "props": []},
+                {
+                    "name": "span",
+                    "type": "web",
+                    "props": [{"name": "class", "value": "product-name"}],
+                },
+            ],
+        },
+    }
+
+    config, count = project._staged_collection_config(
+        {"elementMap": {"name": element}},
+        ["name"],
+        keyword="相机",
+        columns=["商品名称"],
+    )
+
+    assert count == 1
+    assert config is not None
+    assert config["pageInfo"]["windowTitle"] == "组件测评商城"
+    assert config["pageInfo"]["pageUrl"] == "http://127.0.0.1:18766/shop?layout=cards&seed=45"
 
 
 def test_collection_selector_adds_card_scope_for_js_generated_element():
@@ -6102,6 +8000,39 @@ def test_page_scope_uses_css_fallback_for_legacy_capture(tmp_path):
     assert [item["name"] for item in page_scope["selector"]["selector"]] == ["tab", "div"]
     assert page_scope["selector"]["selector"][1]["props"][0]["name"] == "class"
     assert page_scope["selector"]["selector"][1]["props"][0]["value"] == '"title"'
+
+
+def test_page_scope_maps_native_link_name_to_dom_text(tmp_path):
+    paths = _paths(tmp_path)
+    native = _make_project(paths, "page-scope-next-link")
+    next_link = {
+        "id": "next-page",
+        "title": "商品列表",
+        "url": "https://example.test/shop?page=1",
+        "mcpNativeSelector": {
+            "selector": [
+                {"name": "Window", "type": "32", "props": []},
+                {"name": "Document", "type": "6", "props": []},
+                {
+                    "name": "Hyperlink",
+                    "type": "6",
+                    "props": [{"name": "name", "value": '"下一页"'}],
+                },
+            ]
+        },
+    }
+    (native / "elements.json").write_text(
+        json.dumps({"elementMap": {"next-page": next_link}, "groupMap": {}}),
+        encoding="utf-8",
+    )
+
+    project._upsert_page_scope_element(paths, str(native), "next-page")
+
+    payload = json.loads((native / "elements.json").read_text(encoding="utf-8"))
+    selector = payload["elementMap"][project.MCP_PAGE_SCOPE_ELEMENT_ID]["selector"]["selector"]
+    assert selector[-1]["name"] == "a"
+    assert selector[-1]["props"][0]["name"] == "innertext"
+    assert selector[-1]["props"][0]["value"] == '"下一页"'
 
 
 def test_page_scope_rejects_tab_only_context(tmp_path):
@@ -7171,7 +9102,7 @@ def test_native_rpa_cli_cleans_native_ui_after_success_and_failure(monkeypatch):
     ]
 
 
-def test_mcp_capture_windows_starts_takeover_then_routes_missing_browser_to_navigation_step(monkeypatch):
+def test_mcp_capture_windows_reads_without_takeover_then_routes_missing_browser(monkeypatch):
     class FakeBridge:
         def __init__(self, desktop=None):
             pass
@@ -7186,7 +9117,9 @@ def test_mcp_capture_windows_starts_takeover_then_routes_missing_browser_to_navi
     monkeypatch.setattr(
         mcp_server,
         "_rpa_design_ui_ensure_takeover",
-        lambda *args, **kwargs: takeover_calls.append(kwargs) or {"takeover_started": True},
+        lambda *args, **kwargs: takeover_calls.append(kwargs) or pytest.fail(
+            "read-only window capture must not start takeover"
+        ),
     )
     monkeypatch.setattr(
         mcp_server,
@@ -7203,10 +9136,78 @@ def test_mcp_capture_windows_starts_takeover_then_routes_missing_browser_to_navi
     assert result["next_action"] == {
         "tool": "shizai_rpa_open_browser",
         "arguments": {"project_ref": "FLOW_REF", "allow_write": True},
-        "reason": "当前不存在可识别的 Chrome 页面；根据已分析的 navigate 操作定位计划步骤并原生单步执行，禁止继续 scan_page。",
+        "reason": "当前不存在可识别的 Chrome 页面；从已保存导航步骤打开目标页后再捕获，禁止继续 scan_page。",
     }
-    assert len(takeover_calls) == 1
-    assert result["native_ui"]["takeover"]["takeover_started"] is True
+    assert takeover_calls == []
+    assert result["native_ui"]["access"] == {
+        "mode": "capture_read",
+        "takeover_required": False,
+        "countdown_started": False,
+        "picker_overlay_started": False,
+        "flow_ref": "FLOW_REF",
+    }
+
+
+def test_mcp_capture_windows_returns_only_authoring_identity(monkeypatch):
+    class FakeBridge:
+        def __init__(self, desktop=None):
+            pass
+
+        def capture_windows(self, *, include_non_chrome=False):
+            return {
+                "kind": "shizai_deep_capture_windows",
+                "count": 1,
+                "windows": [{
+                    "element_id": "wnd:1",
+                    "title": "京东 - Google Chrome",
+                    "page_title": "京东",
+                    "page_url": "https://www.jd.com",
+                    "process": "123",
+                    "detail": {"meta": ["large"]},
+                    "selector": {"commonProps": {"large": True}},
+                }],
+                "status": {
+                    "deep_capture_rpc": True,
+                    "runtime_extension": {"ready": True, "state": "ready", "extensions": ["large"]},
+                    "installation": {"large": True},
+                },
+                "chrome_session": {"detected": True},
+            }
+
+    monkeypatch.setattr(mcp_server, "_paths", lambda: object())
+    monkeypatch.setattr(mcp_server, "_desktop_client", lambda: object())
+    monkeypatch.setattr(mcp_server, "ShizaiExtensionBridge", FakeBridge)
+    monkeypatch.setattr(
+        mcp_server.project_core,
+        "read_rpa_flow",
+        lambda *_args, **_kwargs: {"flow": {"target_url": "https://www.jd.com"}},
+    )
+    monkeypatch.setattr(mcp_server, "_rpa_design_ui_ensure_takeover", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        mcp_server,
+        "_rpa_design_ui_update",
+        lambda *args, **kwargs: {"state": kwargs["state"]},
+    )
+
+    result = mcp_server._dispatch(
+        "shizai_rpa_capture_windows",
+        {"project_ref": "FLOW_REF", "include_non_chrome": False},
+    )
+
+    assert result["windows"] == [{
+        "element_id": "wnd:1",
+        "title": "京东 - Google Chrome",
+        "page_title": "京东",
+        "page_url": "https://www.jd.com",
+        "process": "123",
+        "selected": True,
+    }]
+    assert result["extension"] == {
+        "deep_capture_rpc": True,
+        "runtime_ready": True,
+        "runtime_state": "ready",
+    }
+    assert "status" not in result
 
 
 def test_mcp_scan_page_short_circuits_when_browser_is_missing(monkeypatch):
@@ -7231,7 +9232,9 @@ def test_mcp_scan_page_short_circuits_when_browser_is_missing(monkeypatch):
     monkeypatch.setattr(
         mcp_server,
         "_rpa_design_ui_ensure_takeover",
-        lambda *args, **kwargs: takeover_calls.append(kwargs) or {"takeover_started": True},
+        lambda *args, **kwargs: takeover_calls.append(kwargs) or pytest.fail(
+            "read-only page scan must not start takeover"
+        ),
     )
     monkeypatch.setattr(
         mcp_server,
@@ -7245,10 +9248,89 @@ def test_mcp_scan_page_short_circuits_when_browser_is_missing(monkeypatch):
     )
 
     assert calls == ["capture_windows"]
-    assert len(takeover_calls) == 1
+    assert takeover_calls == []
     assert result["workflow_status"] == "blocked"
     assert result["next_action"]["tool"] == "shizai_rpa_open_browser"
     assert result["next_action"]["arguments"] == {"project_ref": "FLOW_REF", "allow_write": True}
+    assert result["native_ui"]["access"]["countdown_started"] is False
+    assert result["native_ui"]["access"]["picker_overlay_started"] is False
+
+
+def test_mcp_scan_page_enables_internal_targeted_strategy(monkeypatch):
+    scan_calls = []
+
+    class FakeBridge:
+        def __init__(self, desktop=None):
+            pass
+
+        def capture_windows(self, *, include_non_chrome=False):
+            pytest.fail("an explicit root from capture_windows must not be enumerated again")
+
+        def scan_page(self, **kwargs):
+            scan_calls.append(kwargs)
+            return {"candidate_count": 1, "candidates": [{"element_id": "uia:search"}]}
+
+    monkeypatch.setattr(mcp_server, "_paths", lambda: object())
+    monkeypatch.setattr(mcp_server, "_desktop_client", lambda: object())
+    monkeypatch.setattr(mcp_server, "ShizaiExtensionBridge", FakeBridge)
+    monkeypatch.setattr(mcp_server, "_rpa_ensure_capture_session", lambda *_args: {"initialized": True})
+    monkeypatch.setattr(
+        mcp_server,
+        "_rpa_design_ui_ensure_takeover",
+        lambda *_args, **_kwargs: pytest.fail("read-only page scan must not start takeover"),
+    )
+    monkeypatch.setattr(mcp_server, "_rpa_design_ui_update", lambda *_args, **_kwargs: {})
+
+    result = mcp_server._dispatch(
+        "shizai_rpa_scan_page",
+        {"project_ref": "FLOW_REF", "root_element_id": "wnd:1", "query": "搜索框"},
+    )
+
+    assert result["candidate_count"] == 1
+    assert scan_calls[0]["strategy"] == "auto"
+    assert scan_calls[0]["root_element_id"] == "wnd:1"
+
+
+def test_mcp_scan_page_reuses_preflight_window_when_root_is_omitted(monkeypatch):
+    scan_calls = []
+
+    class FakeBridge:
+        def __init__(self, desktop=None):
+            pass
+
+        def capture_windows(self, *, include_non_chrome=False):
+            return {
+                "count": 2,
+                "windows": [
+                    {"element_id": "wnd:other", "page_title": "其他页面", "page_url": "https://example.com"},
+                    {"element_id": "wnd:jd", "page_title": "京东", "page_url": "https://www.jd.com"},
+                ],
+            }
+
+        def scan_page(self, **kwargs):
+            scan_calls.append(kwargs)
+            return {"candidate_count": 1, "candidates": [{"element_id": "uia:search"}]}
+
+    monkeypatch.setattr(mcp_server, "_paths", lambda: object())
+    monkeypatch.setattr(mcp_server, "_desktop_client", lambda: object())
+    monkeypatch.setattr(mcp_server, "ShizaiExtensionBridge", FakeBridge)
+    monkeypatch.setattr(mcp_server, "_rpa_ensure_capture_session", lambda *_args: {"initialized": True})
+    monkeypatch.setattr(mcp_server, "_rpa_design_ui_update", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        mcp_server.project_core,
+        "read_rpa_flow",
+        lambda *_args, **_kwargs: {"flow": {"target_url": "https://www.jd.com/search"}},
+    )
+
+    result = mcp_server._dispatch(
+        "shizai_rpa_scan_page",
+        {"project_ref": "FLOW_REF", "query": "搜索框"},
+    )
+
+    assert result["candidate_count"] == 1
+    assert scan_calls[0]["root_element_id"] == "wnd:jd"
+    assert scan_calls[0]["page_title"] == "京东"
+    assert scan_calls[0]["page_url"] == "https://www.jd.com"
 
 
 def test_mcp_open_browser_restores_persisted_flow_target(monkeypatch):
@@ -7264,8 +9346,17 @@ def test_mcp_open_browser_restores_persisted_flow_target(monkeypatch):
     monkeypatch.setattr(mcp_server, "ShizaiExtensionBridge", FakeBridge)
     monkeypatch.setattr(
         mcp_server,
+        "_rpa_open_capture_target",
+        lambda *args, **kwargs: {
+            "opened": True,
+            "method": "current_chrome_design_helper",
+            "navigation": {"step_id": "navigate-here"},
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server,
         "_rpa_run_navigation_component",
-        lambda *args, **kwargs: {"executed": True, "navigation": {"step_id": "navigate-here"}},
+        lambda *args, **kwargs: pytest.fail("open_browser must not start blocking DAP validation"),
     )
     monkeypatch.setattr(
         mcp_server,
@@ -7280,9 +9371,52 @@ def test_mcp_open_browser_restores_persisted_flow_target(monkeypatch):
 
     assert result["opened"] is True
     assert result["navigation_run"]["navigation"]["step_id"] == "navigate-here"
+    assert result["navigation_run"]["executed"] is False
+    assert result["navigation_run"]["runtime_verified"] is False
     assert result["capture_started"] is True
     assert result["next_action"]["tool"] == "shizai_rpa_capture_windows"
     assert result["next_action"]["arguments"]["project_ref"] == "FLOW_REF"
+
+
+def test_mcp_project_list_uses_compact_filtered_reader(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mcp_server, "_paths", lambda: object())
+    monkeypatch.setattr(mcp_server, "_desktop_client", lambda: object())
+    monkeypatch.setattr(
+        mcp_server.project_core,
+        "list_projects_compact",
+        lambda _paths, **kwargs: calls.append(kwargs) or {"kind": "shizai_project_list", "projects": []},
+    )
+
+    result = mcp_server._dispatch(
+        "shizai_project_list",
+        {"query": "京东", "limit": 2},
+    )
+
+    assert result["projects"] == []
+    assert calls == [{"query": "京东", "limit": 2}]
+
+
+def test_project_list_compact_filters_before_recursive_inspection(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    root = paths.applications_root / "test-project"
+    root.mkdir(parents=True)
+    (root / "szrpa.json").write_text(
+        json.dumps({"packageName": "Test Flow", "description": "京东采集"}), encoding="utf-8"
+    )
+    other = paths.applications_root / "other-project"
+    other.mkdir()
+    (other / "szrpa.json").write_text(
+        json.dumps({"packageName": "其他流程", "description": "不匹配"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(project, "_project_summary", lambda *_args: pytest.fail("must stay shallow"))
+
+    result = project.list_projects_compact(paths, query="Test Flow", limit=1)
+
+    assert result["total"] == 1
+    assert result["count"] == 1
+    assert result["projects"][0]["path"] == str(root)
+    assert "json_files" not in result["projects"][0]
 
 
 def test_mcp_navigation_step_is_resolved_from_intent_mapping_not_position(monkeypatch):
@@ -7322,6 +9456,85 @@ def test_mcp_navigation_step_is_resolved_from_intent_mapping_not_position(monkey
         "component": "Browser_Component_From_Live_Catalog",
         "operation_ids": ["op-navigate"],
         "purpose": "打开请求目标",
+    }
+
+
+@pytest.mark.parametrize("planned_url", [None, "https://obsolete.example.test"])
+def test_mcp_open_browser_uses_saved_manual_component_url(monkeypatch, planned_url):
+    node = {"id": "manual-browser", "component": "WebBrowser_CreateV3", "config": {"url": "www.example.test/search"}}
+    flow = {"steps": [node], "component_plan": []}
+    if planned_url:
+        flow["component_plan"] = [{**node, "config": {"url": planned_url}}]
+    monkeypatch.setattr(mcp_server.project_core, "read_rpa_flow", lambda *_args: {"flow": flow})
+    opened = []
+    monkeypatch.setattr(mcp_server, "open_current_chrome", lambda url, **_kwargs: opened.append(url) or {"opened": True})
+
+    result = mcp_server._rpa_open_capture_target(object(), "MANUAL_FLOW")
+    assert opened == ["https://www.example.test/search"]
+    assert result["navigation"]["step_id"] == "manual-browser"
+    assert result["runtime_verified"] is False
+
+
+@pytest.mark.parametrize("url", [{"variable": "target"}, "target_url", "javascript:alert(1)", ""])
+def test_mcp_open_browser_does_not_open_unresolved_or_non_web_url(monkeypatch, url):
+    node = {"id": "manual-browser", "component": "WebBrowser_CreateV3", "config": {"url": url}}
+    monkeypatch.setattr(mcp_server.project_core, "read_rpa_flow", lambda *_args: {"flow": {"steps": [node]}})
+
+    def must_not_open(*_args, **_kwargs):
+        raise AssertionError("invalid saved URL must not open a browser")
+
+    monkeypatch.setattr(mcp_server, "open_current_chrome", must_not_open)
+    with pytest.raises(ValueError, match="valid http"):
+        mcp_server._rpa_open_capture_target(object(), "MANUAL_FLOW")
+
+
+def test_mcp_owned_design_tab_cleanup_uses_project_ownership(monkeypatch):
+    calls = []
+
+    class Bridge:
+        def call(self, method, params, *, timeout=None):
+            calls.append((method, params, timeout))
+            return {"status": "closed", "closed": True, "owned": True}
+
+    monkeypatch.setattr(mcp_server, "_browser_bridge_manager", lambda: Bridge())
+
+    result = mcp_server._rpa_close_owned_design_tab("FLOW_REF", reason="run_failed")
+
+    assert result["status"] == "closed"
+    assert result["reason"] == "run_failed"
+    assert calls == [
+        ("close_design_tab", {"ownerKey": mcp_server.design_owner_key("FLOW_REF")}, 10)
+    ]
+
+
+def test_mcp_owned_design_tab_cleanup_skips_missing_project_ref(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server,
+        "_browser_bridge_manager",
+        lambda: pytest.fail("missing project refs must not call the browser bridge"),
+    )
+
+    assert mcp_server._rpa_close_owned_design_tab("", reason="run_failed") == {
+        "status": "skipped",
+        "owned": False,
+        "reason": "missing_project_ref",
+    }
+
+
+def test_mcp_status_returns_write_gated_browser_cleanup_action(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server.project_core,
+        "native_rpa_status",
+        lambda *_args: {"status": "succeeded", "message": "done"},
+    )
+
+    result = mcp_server._dispatch("shizai_rpa_status", {"project_ref": "FLOW_REF"})
+
+    assert "design_tab_cleanup" not in result
+    assert result["browser_cleanup_action"] == {
+        "tool": "shizai_rpa_browser_session_stop",
+        "arguments": {"project_ref": "FLOW_REF", "close_browser": True, "allow_write": True},
+        "reason": "任务已结束；关闭本流程的捕获会话和 MCP 扩展创建的设计标签页。",
     }
 
 
@@ -7517,7 +9730,11 @@ def test_mcp_capture_elements_always_closes_picker_and_native_mask(monkeypatch, 
             "binding_status": "unbound",
         },
     )
-    monkeypatch.setattr(mcp_server, "_rpa_design_ui_ensure_takeover", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        mcp_server,
+        "_rpa_design_ui_ensure_takeover",
+        lambda *_args, **_kwargs: pytest.fail("selector capture must not start takeover"),
+    )
     monkeypatch.setattr(mcp_server, "_rpa_design_ui_update", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         mcp_server.project_core,
@@ -7551,6 +9768,8 @@ def test_mcp_capture_elements_always_closes_picker_and_native_mask(monkeypatch, 
         ]
         assert result["native_ui"]["inspect_stop"]["overlay_state"] == "inactive"
         assert result["native_ui"]["native_mask"]["visible"] is False
+        assert result["native_ui"]["access"]["countdown_started"] is False
+        assert result["native_ui"]["access"]["picker_overlay_started"] is False
 
 
 def test_mcp_capture_elements_forwards_explicit_rebind(monkeypatch):
@@ -7588,7 +9807,11 @@ def test_mcp_capture_elements_forwards_explicit_rebind(monkeypatch):
     monkeypatch.setattr(mcp_server, "ShizaiExtensionBridge", FakeBridge)
     monkeypatch.setattr(mcp_server, "NativeMask", FakeMask)
     monkeypatch.setattr(mcp_server, "_rpa_unbound_element_step", target_step)
-    monkeypatch.setattr(mcp_server, "_rpa_design_ui_ensure_takeover", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        mcp_server,
+        "_rpa_design_ui_ensure_takeover",
+        lambda *_args, **_kwargs: pytest.fail("selector capture must not start takeover"),
+    )
     monkeypatch.setattr(mcp_server, "_rpa_design_ui_update", lambda *_args, **_kwargs: {})
 
     result = mcp_server._dispatch(
@@ -7605,13 +9828,53 @@ def test_mcp_capture_elements_forwards_explicit_rebind(monkeypatch):
     assert result["rebind"] is True
 
 
+def test_mcp_validate_collection_fails_when_native_preview_has_no_rows(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_paths", lambda: object())
+    monkeypatch.setattr(mcp_server, "_desktop_client", lambda: object())
+    monkeypatch.setattr(mcp_server, "_rpa_design_ui_update", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        mcp_server.project_core,
+        "validate_rpa_step",
+        lambda *_args, **_kwargs: {
+            "component": "WebBrowser_DataCollectionV5",
+            "valid": True,
+            "errors": [],
+            "checks": [],
+            "verification_gate": {},
+            "next_action": {},
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server.project_core,
+        "preview_rpa_collection",
+        lambda *_args, **_kwargs: {
+            "performed": True,
+            "valid": False,
+            "data_row_count": 0,
+            "message": "原生数据采集预览只有表头或为空；禁止运行未修改的采集步骤。",
+            "next_action": {"tool": "shizai_rpa_read_flow"},
+        },
+    )
+
+    result = mcp_server._dispatch_impl(
+        "shizai_rpa_validate_step",
+        {"flow_ref": "FLOW_REF", "step_id": "collect", "strict": True},
+    )
+
+    assert result["valid"] is False
+    assert result["native_collection_preview"]["data_row_count"] == 0
+    assert result["checks"][-1]["name"] == "native_collection_preview"
+    assert result["verification_gate"]["status"] == "static_failed"
+    assert result["next_action"] == {"tool": "shizai_rpa_read_flow"}
+
+
 def test_mcp_server_exposes_a_compact_consistent_contract():
     server = mcp_server.build_server()
     tools = mcp_server._schemas()
     names = [tool.name for tool in tools]
     schemas = {tool.name: tool for tool in tools}
 
-    assert len(names) == 56
+    assert len(names) == 67
     assert len(names) == len(set(names))
     assert all(tool.inputSchema["additionalProperties"] is False for tool in tools)
     assert {
@@ -7624,8 +9887,16 @@ def test_mcp_server_exposes_a_compact_consistent_contract():
         "shizai_apply_flow",
         "shizai_rpa_start_design",
         "shizai_rpa_open_browser",
+        "shizai_browser_activate_tab",
+        "shizai_browser_capture_viewport",
+        "shizai_browser_inspect_points",
+        "shizai_browser_infer_collection",
+        "shizai_rpa_capture_page_fields",
         "shizai_rpa_component_catalog",
+        "shizai_rpa_reload_editor",
+        "shizai_rpa_run_component",
         "shizai_rpa_add_step",
+        "shizai_rpa_remove_step",
         "shizai_rpa_validate_flow",
         "shizai_rpa_materialize",
         "shizai_rpa_debug_command",
@@ -7644,6 +9915,9 @@ def test_mcp_server_exposes_a_compact_consistent_contract():
     assert "shizai_rpa_component_catalog" in schemas["shizai_components"].description
     assert "verification_gate" in schemas["shizai_rpa_add_step"].description
     assert "verification_gate" in schemas["shizai_rpa_validate_step"].description
+    import_schema = schemas["shizai_project_import_elements"].inputSchema
+    assert import_schema["required"] == ["project_ref", "allow_write"]
+    assert {"elements", "source_project_ref", "element_ids"} <= set(import_schema["properties"])
 
     source = ast.parse(textwrap.dedent(inspect.getsource(mcp_server._dispatch_impl)))
     handlers = {
@@ -7660,7 +9934,10 @@ def test_mcp_server_exposes_a_compact_consistent_contract():
     # controls (message, tips, request_id, and force) to be explicit.
     # Full mode now includes shared plan structure and versioned edit fields;
     # the optional authoring surface has a separate, smaller budget test.
-    assert len(encoded_tools) <= 40_000
+    # The cap moved by the footprint of shizai_rpa_save_editor (~540 characters),
+    # which joins the surface with the native editor save contract; redundant
+    # prose elsewhere was trimmed first so the increase stays at that footprint.
+    assert len(encoded_tools) <= 46_600
     assert len(mcp_server.MCP_INSTRUCTIONS) <= 2_100
     assert "薄 stdio 包装" in mcp_server.MCP_INSTRUCTIONS
     assert "verification_gate" in mcp_server.MCP_INSTRUCTIONS
@@ -7947,6 +10224,48 @@ def test_native_component_catalog_searches_installed_dictionary(tmp_path):
     assert "不因未选原生组件而硬失败" in policy["fallback_rule"]
 
 
+@pytest.mark.parametrize("query", ["javascript", "浏览器脚本", "网页执行", "执行脚本"])
+def test_native_component_catalog_finds_js_component_from_model_vocabulary(tmp_path, query):
+    paths = _paths(tmp_path)
+    engine = tmp_path / "rpa-engine"
+    dictionary = engine / "componentDicts" / "componentsNew.json"
+    dictionary.parent.mkdir(parents=True)
+    dictionary.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "WebBrowser_RunJsInIeBySelector_v3",
+                    "label": "执行JS",
+                    "category": "webBrowser",
+                    "description": "在目标浏览器中执行自定义js代码。",
+                    "baseType": "WebBrowser_RunJsInIeBySelector",
+                    "definition": {"args0": [{"name": "jsCode"}], "options0": []},
+                    "codeDesc": [{"func": "WebBrowser.RunJsInIeBySelector_v3", "args": ["jsCode"]}],
+                },
+                {
+                    "type": "System_ExecuteCommandV1",
+                    "label": "执行命令行",
+                    "description": "执行脚本",
+                    "baseType": "System_ExecuteCommand",
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = component_catalog.component_catalog(
+        paths,
+        engine_root=str(engine),
+        scope="builtin",
+        query=query,
+        detail="summary",
+        limit=10,
+    )
+
+    assert "WebBrowser_RunJsInIeBySelector_v3" in {item["type"] for item in result["components"]}
+
+
 def test_component_catalog_infers_collection_and_click_capabilities_from_contracts(tmp_path):
     paths = _paths(tmp_path)
     engine = tmp_path / "rpa-engine"
@@ -8005,7 +10324,16 @@ def test_component_catalog_infers_collection_and_click_capabilities_from_contrac
     assert collection["requires_page_evidence"] is True
     assert collection["deferred_bindings"] == ["config", "selector_page", "selector_more"]
     assert collection["configuration_hints"]["row_limit_parameters"] == ["collect_items"]
+    assert collection["configuration_hints"]["region_modes"]["0"]["meaning"] == "all_pages"
+    assert collection["configuration_hints"]["region_modes"]["3"]["meaning"] == "specified_item_count"
     assert collection["planning_patterns"][0]["semantic_config"] == {
+        "region": 0,
+        "page_type": "$choose_from_live_page_evidence",
+        "selector_page": "$defer_until_next_page_element_is_captured",
+        "selector_more": "$defer_until_load_more_element_is_captured",
+    }
+    assert collection["planning_patterns"][0]["output_contract"] == {"max_rows": None}
+    assert collection["planning_patterns"][1]["semantic_config"] == {
         "region": 3,
         "collect_items": "$output_contract.max_rows",
         "page_type": "$choose_from_live_page_evidence",
@@ -8424,6 +10752,22 @@ def test_native_status_enforces_minimum_row_count_and_detail_links(tmp_path, cas
     assert result["output"]["expected_data_row_count"] == max_rows
 
 
+def test_requested_output_row_count_ignores_component_limit_when_request_has_no_count():
+    assert project._requested_output_row_count(
+        {
+            "max_rows": 1000,
+            "request_analysis": {"evidence": {"collection": {"max_rows": None}}},
+        }
+    ) == 0
+    assert project._requested_output_row_count(
+        {
+            "max_rows": 1000,
+            "request_analysis": {"evidence": {"collection": {"max_rows": 25}}},
+        }
+    ) == 25
+    assert project._requested_output_row_count({"max_rows": 10}) == 10
+
+
 def test_native_status_exposes_missing_output_and_runtime_ui_feedback(tmp_path, monkeypatch):
     paths = _paths(tmp_path)
     target = _make_project(paths, "missing-output")
@@ -8552,6 +10896,34 @@ def test_native_runtime_plugin_blocker_prioritizes_user_interaction_marker(tmp_p
     assert signal["reason"] == reason
     assert signal["interaction"]["action"] == action
     assert signal["interaction"]["automation_may_login"] is False
+
+
+def test_native_runtime_plugin_blocker_ignores_markers_inside_script_source(tmp_path):
+    paths = _paths(tmp_path)
+    log_path = paths.data_root / "logs" / "2026-09-01" / "output-logs" / "run_source_fixture.jsonl"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text(json.dumps({"data": {"runStatus": "started"}}) + "\n", encoding="utf-8")
+    baseline = project._native_runtime_log_snapshot(paths)
+
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "data": {
+                        "engineAction": "error",
+                        "runStatus": "error",
+                        "scriptCode": 'throw new Error("SHIZAI_WAITING_FOR_USER:login_required")',
+                    }
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+
+    signal = project._native_runtime_plugin_blocker(paths, baseline)
+    assert signal is not None
+    assert signal["kind"] == "runtime_execution_failed"
 
 
 def test_native_run_status_preserves_waiting_for_user_over_error_terminal(tmp_path):
@@ -8960,8 +11332,19 @@ def test_mcp_rpa_run_attempts_runtime_when_enabled_mv3_host_is_on_demand(monkeyp
     assert result["native_ui"]["preflight_recovery"]["runtime_extension_deferred_probe"]["accepted"] is True
 
 
-def test_mcp_rpa_run_never_touches_deep_capture_and_uses_native_tars_card(monkeypatch):
+def test_mcp_rpa_run_auto_materializes_without_touching_deep_capture(monkeypatch):
     events = []
+    diagnoses = iter(
+        [
+            {
+                "can_run": False,
+                "materialization_required": True,
+                "errors": ["runtime tree is stale"],
+                "warnings": [],
+            },
+            {"can_run": True, "materialization_required": False},
+        ]
+    )
 
     class FakeBridge:
         def __init__(self, desktop=None):
@@ -9001,7 +11384,12 @@ def test_mcp_rpa_run_never_touches_deep_capture_and_uses_native_tars_card(monkey
     monkeypatch.setattr(
         mcp_server.project_core,
         "native_rpa_sync_diagnose",
-        lambda *args, **kwargs: {"can_run": True, "materialization_required": False},
+        lambda *args, **kwargs: next(diagnoses),
+    )
+    monkeypatch.setattr(
+        mcp_server.project_core,
+        "materialize_native_rpa",
+        lambda *args, **kwargs: events.append(("materialize", kwargs)) or {"ready": True},
     )
     monkeypatch.setattr(
         mcp_server.project_core,
@@ -9018,6 +11406,8 @@ def test_mcp_rpa_run_never_touches_deep_capture_and_uses_native_tars_card(monkey
     assert card_events[0][1]["state"] == "validating"
     assert ("capture_session_start", "CLIENT_APPLICATION_PATH") not in events
     assert not any(item[0] == "capture_stop" for item in events)
+    assert len([item for item in events if item[0] == "materialize"]) == 1
+    assert [item for item in events if item[0] == "materialize"][0][1]["strict"] is True
     assert len([item for item in events if item[0] == "inspect_stop"]) == 2
     assert card_events[1][1]["state"] == "running"
     assert "塔斯正在运行流程" in card_events[1][1]["message"]
@@ -9052,7 +11442,7 @@ def test_mcp_rpa_run_blocks_when_runtime_diagnosis_is_not_ready(monkeypatch):
         "native_rpa_sync_diagnose",
         lambda *args, **kwargs: {
             "can_run": False,
-            "materialization_required": True,
+            "materialization_required": False,
             "errors": ["runtime tree is stale"],
             "warnings": [],
         },
@@ -10722,6 +13112,12 @@ def test_native_collection_binding_ignores_dynamic_uia_indexes(tmp_path):
     assert project._native_collection_element_ids(task, elements) == ["product"]
 
 
+def test_collection_to_excel_setting_preserves_plan_and_rebind_values():
+    assert project._collection_to_excel_setting({"toExcel": 0}, excel_mode=False, fallback=1) == 0
+    assert project._collection_to_excel_setting({}, excel_mode=False, fallback="0") == 0
+    assert project._collection_to_excel_setting({"toExcel": 1}, excel_mode=True, fallback=1) == 0
+
+
 def test_native_element_prune_keeps_flow_bindings_and_removes_stale_records(tmp_path):
     paths = _paths(tmp_path)
     native = paths.applications_root / "prune-native"
@@ -11125,7 +13521,13 @@ def test_native_module_uses_designer_call_names_and_output_bindings():
 def test_native_element_click_data_is_emitted_with_integer_fields():
     rendered = project._native_code_expression(
         "click_data",
-        {"cursorPosition": "0", "offset": {"x": "0", "y": "0"}, "random": "0"},
+        json.dumps(
+            {
+                "cursorPosition": "0",
+                "offset": {"x": "0", "y": "0", "random": "0"},
+                "random": "0",
+            }
+        ),
     )
 
     assert ast.literal_eval(rendered) == {

@@ -56,6 +56,32 @@ when the CLI or its workflow contract changes, and follow it before editing code
 
 ## Binding
 
+- Extension 0.1.10 source verifies repeated fields by identity in every row, not
+  sibling positions inferred from the first card. Missing/ambiguous fields, duplicate
+  column targets and visible page-wide matches outside the rows fail rather than drop
+  rows or substitute another node. Samples and native bindings use the same verified
+  `fieldSelector`; `sourceSelector` preserves the original observed input.
+- `collection_elements` requires `verification.method=field-identity-per-row` and
+  equal candidate/verified/returned row counts. It must not broaden a selector by
+  stripping positional predicates in Python. An older extension needs upgrade/reload.
+  This change remains unreleased; the live 2026-10-08 success used 0.1.9 and exposed
+  the bad positional sample, while native field bindings returned correct raw values.
+
+- The companion bridge can be owned or shared (`connection_mode=owner/shared`).
+  Additional MCP processes use the same loopback port's `/mcp` WebSocket endpoint,
+  authenticated with the installation token and rejecting every browser Origin.
+  It is a relay to the existing extension connection, not another extension session.
+  A surviving manager may acquire the port on its next call after the owner exits.
+- A lost in-flight browser operation has an unknown outcome: fail pending requests
+  promptly, never replay clicks/inputs, and tell the model to re-observe the page.
+  Only pre-send transport loss is `not_sent`. Status reads are safe to retry.
+  An extension that connects during a call's initial wait must receive that call;
+  returning only `ready` would falsely imply the requested action completed.
+- Browser sharing tests use both real stdio MCP processes and a controlled WebSocket
+  extension peer. Keep that evidence separate from actual Chrome and native RPA tests.
+  Version labels alone do not prove installation freshness; compare advertised tools
+  (the installed 0.7.28 EXE on 2026-10-08 had 56 tools, source had 67).
+
 - Missing `outputs` in a model plan means "use the native contract"; explicit
   `outputs: []` means "keep this assertion" and must not be silently filled.
 - A pagination control is a page-control binding, not an output column. Never add
@@ -81,11 +107,42 @@ when the CLI or its workflow contract changes, and follow it before editing code
 - `workflow_edit.read_edit_context` reads IDs and selected parameters from the
   actual native task, including nested nodes. It must not substitute cached plan
   config for authoritative arguments. Native expressions remain labelled as such.
+- Native step removal is revision-driven (`remove_rpa_step` / `shizai_rpa_remove_step`
+  / `workflow rpa-remove-step`). It refuses a step whose output variable is still read
+  by a later statement unless `allow_dependents=true`, and it drops the plan entry plus
+  the JS-link metadata that only described the deleted node. A preview must not publish
+  designer UI: `validate_rpa_project` and `validate_rpa_flow` take `publish_ui=False`
+  for read-only callers.
+- Saving the active editor is revision-driven too (`save_rpa_editor` /
+  `shizai_rpa_save_editor` / `workflow rpa-save-editor`). It forwards
+  `PackageSaveService.saveAll` and then re-reads the dirty flag, revision and step
+  list; a still-dirty editor returns `save_unconfirmed` with `retryable=true`
+  instead of reporting success.
+- A full run or a debug start must not proceed while the active editor has unsaved
+  changes. Both entry points return `editor_unsaved_changes` with a
+  `shizai_rpa_save_editor` next action; an absent editor does not block, and the
+  result records `editor_present=false`.
+- Global keyboard components (`Keyboard_*`, currently `Keyboard_PressNew` and
+  `Keyboard_Send_V1`) type into whichever window owns the focus, so their preflight
+  verifies the target Chrome window instead of an element binding. The check matches
+  the flow's element page title, restores and foregrounds the window, and re-reads the
+  foreground handle; an unconfirmed focus returns `window_focus_unverified`, and a
+  target that cannot be identified from a title returns `target_window_unknown`. Both
+  block the step; neither passes silently.
+- Page components consume the upstream browser node's own output variable, which a
+  model plan may rename. `collection_web_page_binding` and `js_web_page_binding`
+  therefore accept the predecessor's decoded `var_name`, the planned output names and
+  the canonical `网页对象` default, and report the accepted names on failure.
+- A plan may name fewer outputs than the native component writes, because the designer
+  always emits every declared slot. Surplus trailing slots pass only when each one is a
+  canonical output of that component (for example `监控空列数据`); any other surplus
+  keeps failing and is named in the check detail.
 - Revisions cover task files, metadata, elements and variable bindings. Check at
   preparation and immediately before mutation. This does not lock external
   designer writes or provide rollback across multiple files/RPC materialization.
-- `SHIZAI_MCP_TOOL_PROFILE=rpa-authoring` advertises 29 RPA tools; default `full`
-  keeps 56. Initialization instructions and callable tool names must agree.
+- `SHIZAI_MCP_TOOL_PROFILE=rpa-authoring` advertises 43 RPA tools, including add_step
+  and its existing before_step_id main-flow insertion option; default `full`
+  keeps 67. Initialization instructions and callable tool names must agree.
 - Whole-plan creation can persist the graph before component verification;
   the verify-before-append rule applies to incremental `add_step` operations.
 
@@ -101,7 +158,31 @@ model plan and metadata. Generated modules and indexes must agree with both befo
 running or opening the flow in the client. A designer RPC success response alone
 is not proof of persistence.
 
+- Debug task discovery must delegate to the same `_native_task_file` resolver
+  used by editing. Never keep a second recursive task selector in debug_session:
+  an actual 0.7.29 session selected a 9-step draft backup while read_flow correctly
+  selected the 7-step root task. The session was stopped before next; the source
+  fix excludes restore backups and fails when only a backup remains.
+- Browser preparation supports manual designer flows without a component_plan.
+  Resolve their native steps using live navigation contracts, prefer the saved
+  native URL over stale plan metadata, and accept a literal bare hostname via
+  HTTPS. Unresolved variable objects/names and non-HTTP schemes must not open.
+  Plan/native identity mismatch checks still apply when a model plan exists.
+
 ## Verification
+
+- Progress capsules must be scoped to finite MCP operations: analysis, creation,
+  window/page scans, field capture, step/flow validation and exact component runs
+  close their card in dispatch finally, on success or error. Closing this hint
+  must not stop a paused debugger, picker, or its browser object cache. Do not
+  auto-close cards for ongoing debug/picker commands or explicit UI controls.
+- Explicit `rpa_stop` must close the small card and takeover frame as well as the
+  runtime mask. A core runtime `cleanup_complete=true` does not prove all desktop
+  surfaces disappeared. The 2026-10-08 capsule remained after successful native
+  collection because validate_step opened it and run_component/stop left it open.
+  A card close warning must not be treated as success or clear the retry marker.
+  Source lifecycle repair is not yet installed; live cleanup used the installed
+  CLI `ui small-card --state hidden --allow-write` and the window disappeared.
 
 - Design incrementally: write one component, validate it, capture/bind its real
   element if needed, then single-step it before adding dependent work.
@@ -197,6 +278,38 @@ is not proof of persistence.
   evidence, problems, root cause, and optimization direction after every run.
 
 ## Release And Remotes
+
+- 2026-10-08: 0.7.29 published to Gitee (source), GitHub (ZIP/checksum) and npm
+  (latest); local installation passed actual EXE full=67/authoring=43 and hash checks.
+  npm may accept publication with HTTP 202 before the version becomes resolvable;
+  verify the public version/dist tag separately before claiming availability.
+  Root install.ps1 now uses the matching npm installer because GitHub main source
+  no longer receives updates. Do not restore the stale raw GitHub installer URL.
+- Browser host registration is persistent. After user loading on 2026-10-08,
+  actual MCP browser_status returned ready/connected, extension 0.1.9. The existing
+  7-step JD flow's native collection returned a fresh 59-by-4 table via the attached
+  MCP tools; this supersedes the earlier extension_missing installation observation.
+  Three rows repeat; one price is pending publication; heat mixes sales/reviews/views.
+  This is human-guided component validation, not Luna/Qwen, pagination, 100-row or
+  Excel acceptance. See MCP_BROWSER_EXTENSION_LIVE_EVALUATION_20261008.md.
+  The 0.1.10 field-identity fix is source-only and has not replaced the installed package.
+
+- Starting with 0.7.29, the npm launcher and server have the same version. The
+  launcher takes its default target from package.json, not another hard-coded version.
+  The release build checks all source version declarations before compiling.
+- `release_integrity` verifies the frozen MCP's exact schemas for both profiles,
+  isolated browser status, quiet shutdown, CLI version and Native Messaging bootstrap.
+  `release-manifest.json` includes the verified tool names/counts and payload hashes.
+  Installers must validate it before stopping/replacing existing programs; no missing
+  extension/host payload may be labelled successful. Exclude extension tests from ZIPs.
+- Browser host registration defaults on, but does not prove the unpacked extension
+  is loaded by Chrome/Edge. Upgrade preserves the existing installation token and port.
+  Frozen MCP and Native Host read config beside their own executable, honoring an
+  explicit SHIZAI_BROWSER_BRIDGE_CONFIG override. Never persist a temporary host path.
+- npm status distinguishes config, extension files, native host and unknown loaded state.
+  MCP status diagnoses incomplete managed installs and stale native registrations.
+  The npm stdio launch path refuses stale installs rather than printing install logs
+  into protocol stdout or terminating other sessions to upgrade behind the caller.
 
 - After a code or documentation change is verified, commit and push the source
   changes to the Gitee remote `origin` in a timely manner.

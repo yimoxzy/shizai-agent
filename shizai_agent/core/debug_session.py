@@ -22,7 +22,8 @@ from typing import Any, Callable
 
 from .agent import redact_payload
 from .cloud_api import ShizaiCloudError, ShizaiDesktopAgent
-from .extension_bridge import ShizaiExtensionBridge, set_rpa_ui_feedback
+from .extension_bridge import ShizaiExtensionBridge, check_chrome_window_focus, set_rpa_ui_feedback
+from .native_ui import call_active_editor_renderer
 from .paths import ShizaiPaths
 
 _SESSION_DIR_NAME = "mcp-debug-sessions"
@@ -60,6 +61,23 @@ _ELEMENT_DEPENDENT_COMPONENTS = {
     "WebBrowser_DataCollectionV5",
     "WebBrowser_RunJsInIeBySelector_v3",
 }
+_REQUIRED_ELEMENT_COMPONENTS = {
+    "Element_SetValue_V6",
+    "WebBrowser_DataCollectionV5",
+}
+# Global keyboard components send real keystrokes to whichever window owns the
+# focus, so they are guarded by a focus check instead of an element binding.
+_GLOBAL_KEYBOARD_COMPONENTS = {
+    "Keyboard_PressNew",
+    "Keyboard_Send_V1",
+}
+_GLOBAL_KEYBOARD_COMPONENT_PREFIX = "Keyboard_"
+
+
+def _is_global_keyboard_component(component: Any) -> bool:
+    """Return true for components that type into the focused window."""
+    name = str(component or "").strip()
+    return name in _GLOBAL_KEYBOARD_COMPONENTS or name.startswith(_GLOBAL_KEYBOARD_COMPONENT_PREFIX)
 
 
 def _call_unlocked(client: Any, service: str, method: str, args: list[Any]) -> Any:
@@ -73,6 +91,62 @@ def _call_unlocked(client: Any, service: str, method: str, args: list[Any]) -> A
 def _app_run_already_stopped(exc: Exception) -> bool:
     """Return true for the vendor's idempotent AppRun stop response."""
     return bool(re.search(r"(?:code\s*=\s*|\b)3001\b", str(exc), flags=re.IGNORECASE))
+
+
+def _stop_designer_debug_controller(
+    client: Any,
+    arrangement_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Mirror the editor's Debug Stop toolbar action for reused DAP sessions."""
+    if not isinstance(client, ShizaiDesktopAgent):
+        return None
+    debugging_before = bool(call_active_editor_renderer(client, "DebugControllerService", "getIsDebugging"))
+    if debugging_before:
+        call_active_editor_renderer(client, "DebugControllerService", "stop")
+    debugging_after = bool(call_active_editor_renderer(client, "DebugControllerService", "getIsDebugging"))
+    if debugging_after:
+        raise ShizaiCloudError("DebugControllerService.stop returned but the active editor is still debugging")
+    if arrangement_id:
+        call_active_editor_renderer(
+            client,
+            "DebugBreakPointService",
+            "deleteTempBreakpointByArrangementId",
+            [arrangement_id],
+        )
+        call_active_editor_renderer(client, "DebugBreakPointService", "saveData")
+    return {
+        "handled": True,
+        "debugging_before": debugging_before,
+        "debugging_after": debugging_after,
+        "stop_requested": debugging_before,
+    }
+
+
+def _active_designer_arrangement(client: Any) -> str | None:
+    """Return the active native arrangement when a real package editor is open."""
+    if not isinstance(client, ShizaiDesktopAgent):
+        return None
+    value = call_active_editor_renderer(client, "ArrangementEditService", "getCurrentArrangementInfo")
+    if not isinstance(value, dict):
+        return None
+    current = value.get("currentEditorId")
+    return str(current).strip() if current else None
+
+
+def _clear_designer_temp_breakpoints(
+    client: Any,
+    arrangement_id: str,
+) -> None:
+    """Remove stale designer breakpoints before MCP configures debugpy directly."""
+    if not isinstance(client, ShizaiDesktopAgent):
+        return
+    call_active_editor_renderer(
+        client,
+        "DebugBreakPointService",
+        "deleteTempBreakpointByArrangementId",
+        [arrangement_id],
+    )
+    call_active_editor_renderer(client, "DebugBreakPointService", "saveData")
 
 
 def _unwrap(value: Any) -> Any:
@@ -196,16 +270,11 @@ def _native_statement_ids(payload: dict[str, Any]) -> list[str]:
 
 
 def _native_task(project_dir: Path) -> tuple[Path, dict[str, Any]]:
-    candidates = sorted(
-        project_dir.rglob("*.task"),
-        key=lambda item: (item.name != "io5cd.task", str(item).lower()),
-    )
-    for task_path in candidates:
-        payload = _read_json(task_path)
-        if payload and isinstance(payload.get("componentModelEntities"), dict):
-            if isinstance(payload["componentModelEntities"].get("MAIN_COMPONENT"), dict):
-                return task_path, payload
-    raise FileNotFoundError(f"no native .task flow found in: {project_dir}")
+    # Editing and debugging must select the same live task. Independent recursive
+    # discovery can select .sz/draft-restore-backup before the root task.
+    from .project import _native_task_file
+
+    return _native_task_file(project_dir)
 
 
 def _task_arguments(node: dict[str, Any]) -> dict[str, Any]:
@@ -299,6 +368,125 @@ def _step_runtime_identity(project_dir: Path, task_path: Path, node: dict[str, A
         "element_ids": element_ids,
         "expected_page_title": page_title,
         "expected_page_url": page_url,
+    }
+
+
+def _flow_page_identity(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Collect the page identity a global keyboard component must target.
+
+    A keyboard component owns no element, so the identity comes from any element
+    the flow has already bound, with the persisted target URL as the fallback.
+    """
+    entities = payload.get("componentModelEntities")
+    element_ids: list[str] = []
+    if isinstance(entities, dict):
+        for component_id in _native_statement_ids(payload):
+            node = entities.get(component_id)
+            if not isinstance(node, dict):
+                continue
+            element_ids.extend(_element_reference_ids(_task_arguments(node).get("uiSelector")))
+            if isinstance(node.get("mcpElementIds"), list):
+                element_ids.extend(
+                    str(item).strip() for item in node["mcpElementIds"] if str(item).strip()
+                )
+    element_ids = list(dict.fromkeys(element_ids))
+    try:
+        elements_payload = json.loads((project_dir / "elements.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, TypeError, ValueError):
+        elements_payload = {}
+    element_map = elements_payload.get("elementMap") if isinstance(elements_payload, dict) else {}
+    page_title = page_url = ""
+    if isinstance(element_map, dict):
+        for element_id in element_ids:
+            element = element_map.get(element_id)
+            if not isinstance(element, dict):
+                continue
+            captured_title, captured_url = _selector_identity(element)
+            page_title = page_title or captured_title
+            page_url = page_url or captured_url
+            if page_title and page_url:
+                break
+    if not page_url:
+        package = _read_json(project_dir / "szrpa.json") or {}
+        page_url = str(package.get("mcpTargetUrl") or "").strip()
+    return {
+        "element_ids": element_ids,
+        "expected_page_title": page_title,
+        "expected_page_url": page_url,
+    }
+
+
+def _keyboard_runtime_preflight(
+    project_dir: Path,
+    task_path: Path,
+    payload: dict[str, Any],
+    node: dict[str, Any],
+    requested_step_id: str,
+) -> dict[str, Any]:
+    """Guard a global keyboard component with a real foreground-window check.
+
+    The component types into whatever window owns the focus, so an unverified
+    focus is a silent misfire rather than a visible failure.  This check never
+    passes the step through on an unknown or unactivated window.
+    """
+    component = str(node.get("type") or "").strip()
+    identity = _flow_page_identity(project_dir, payload)
+    focus = check_chrome_window_focus(
+        expected_title=identity["expected_page_title"],
+        expected_url=identity["expected_page_url"],
+        activate=True,
+    )
+    base = {
+        "kind": "rpa_runtime_preflight",
+        "project_ref": str(project_dir),
+        "task": str(task_path),
+        "step_id": str(node.get("id") or requested_step_id),
+        "component": component,
+        "element_ids": identity["element_ids"],
+        "expected_page_title": identity["expected_page_title"],
+        "expected_page_url": identity["expected_page_url"],
+        "window_focus": focus,
+    }
+    if focus["focused"]:
+        return {
+            **base,
+            "status": "ready",
+            "valid": True,
+            "reason": "window_focused",
+            "message": "目标 Chrome 窗口已在前台，键盘组件可以发送真实按键。",
+            "next_action": {
+                "tool": "shizai_rpa_debug_command",
+                "arguments": {"action": "next"},
+                "reason": "焦点已确认，继续执行当前键盘组件。",
+            },
+        }
+    if focus["reason"] == "target_window_unknown":
+        return {
+            **base,
+            "status": "blocked",
+            "valid": False,
+            "reason": "target_window_unknown",
+            "message": "无法确定该键盘组件应该发送到哪个 Chrome 窗口，禁止执行。",
+            "next_action": {
+                "tool": "shizai_rpa_scan_page",
+                "arguments": {"project_ref": str(project_dir)},
+                "reason": "先在目标页面扫描并绑定元素，让流程带有可核对页面身份后再执行键盘组件。",
+            },
+        }
+    return {
+        **base,
+        "status": "blocked",
+        "valid": False,
+        "reason": "window_focus_unverified",
+        "message": (
+            "键盘组件需要目标 Chrome 窗口位于前台，当前无法确认焦点，禁止执行；"
+            "请把目标 Chrome 窗口切到前台后重试。"
+        ),
+        "next_action": {
+            "tool": "shizai_rpa_debug_capabilities",
+            "arguments": {"project_ref": str(project_dir)},
+            "reason": "先人工聚焦目标 Chrome 窗口，再重新预检当前键盘组件。",
+        },
     }
 
 
@@ -544,8 +732,30 @@ def runtime_preflight(
             "task": str(task_path),
             "next_action": {"tool": "shizai_rpa_debug_status", "reason": "先读取当前停靠组件。"},
         }
+    if _is_global_keyboard_component(node.get("type")):
+        return _keyboard_runtime_preflight(project_dir, task_path, payload, node, requested_step_id)
     identity = _step_runtime_identity(project_dir, task_path, node)
     if identity is None:
+        component = str(node.get("type") or "").strip()
+        if component in _REQUIRED_ELEMENT_COMPONENTS:
+            return {
+                "kind": "rpa_runtime_preflight",
+                "valid": False,
+                "reason": "element_binding_missing",
+                "message": "当前网页组件尚未绑定真实页面元素，不能进入运行或单步调试。",
+                "project_ref": str(project_dir),
+                "step_id": str(node.get("id") or requested_step_id),
+                "component": component,
+                "task": str(task_path),
+                "next_action": {
+                    "tool": "shizai_rpa_scan_page",
+                    "arguments": {
+                        "project_ref": str(project_dir),
+                        "query": str(node.get("label") or "目标网页元素"),
+                    },
+                    "reason": "先从当前真实页面扫描并绑定该步骤需要的元素；没有绑定时禁止执行组件。",
+                },
+            }
         return {
             "kind": "rpa_runtime_preflight",
             "valid": True,
@@ -876,20 +1086,46 @@ class NativeDebugSession:
             self._persist()
         elif message and _is_terminal_debug_error(message):
             self._mark_runtime_error(message)
-        elif self.dap_terminal_event or self._run_result_completed():
+        elif self.dap_terminal_event or self._run_result_completed() or self._designer_confirmed_terminal():
             self.status = "succeeded"
+            self.run_owned = False
+            self.error = None
             self._persist()
         else:
             return False
         return True
 
+    def _designer_confirmed_terminal(self) -> bool:
+        """Use the active editor as immediate terminal evidence for reused sessions."""
+        if self.adapter_mode != "designer_reused" or not isinstance(self.client, ShizaiDesktopAgent):
+            return False
+        try:
+            state = str(
+                _unwrap(call_active_editor_renderer(self.client, "DebugControllerService", "getDebugState")) or ""
+            ).casefold()
+            debugging = bool(
+                _unwrap(call_active_editor_renderer(self.client, "DebugControllerService", "getIsDebugging"))
+            )
+        except Exception:
+            return False
+        return state in {"idle", "terminaled"} and not debugging
+
     def _is_flow_frame(self, frame: dict[str, Any]) -> bool:
         source = frame.get("source") if isinstance(frame.get("source"), dict) else {}
         source_path = _normalize_path(source.get("path"))
         expected = _normalize_path(_generated_module(self.project_dir, self.task_path))
-        return source_path.endswith(expected) or source_path.endswith(
-            _normalize_path(f"flow_modules/{self.task_path.stem}.py")
-        )
+        if source_path == expected:
+            return True
+        project_relative = _normalize_path(f"projects/flow_modules/{self.task_path.stem}.py")
+        if source_path.endswith(project_relative) and expected.endswith(project_relative):
+            source_root = source_path[: -len(project_relative)].rstrip("\\")
+            expected_root = expected[: -len(project_relative)].rstrip("\\")
+            if source_root and expected_root:
+                return source_root == expected_root
+        # Older adapters may expose only a synthetic module path without the
+        # application directory. Keep that form compatible when there is no
+        # project identity to compare.
+        return source_path.endswith(_normalize_path(f"flow_modules/{self.task_path.stem}.py"))
 
     def _set_breakpoints(self) -> None:
         records = _position_records(self.project_dir, self.task_path)
@@ -897,6 +1133,12 @@ class NativeDebugSession:
         lines = sorted({int(record["line"]) for record in selected})
         if not lines:
             raise ShizaiCloudError("no executable component positions were found in the generated flow module")
+        self._set_breakpoint_lines(lines)
+        self.breakpoint_lines = lines
+        self._persist()
+
+    def _set_breakpoint_lines(self, lines: list[int]) -> None:
+        """Replace debugpy breakpoints for the generated flow module."""
         module_path = _generated_module(self.project_dir, self.task_path)
         self._debug(
             "setBreakpoints",
@@ -910,8 +1152,6 @@ class NativeDebugSession:
                 "sourceModified": False,
             },
         )
-        self.breakpoint_lines = lines
-        self._persist()
 
     def _probe_existing_adapter(self) -> bool:
         """Check whether the designer already owns the shared DAP connection.
@@ -1035,6 +1275,7 @@ class NativeDebugSession:
     def _snapshot(self, *, wait_seconds: float = _DEFAULT_WAIT_SECONDS) -> dict[str, Any]:
         deadline = time.monotonic() + max(0.1, wait_seconds)
         last_error: str | None = None
+        component_internal_frame_seen = False
         while time.monotonic() < deadline:
             try:
                 thread_payload = self._debug("threads")
@@ -1089,18 +1330,15 @@ class NativeDebugSession:
                 # for a frame in the generated flow module before reporting a
                 # paused step.
                 if fallback is not None:
+                    component_internal_frame_seen = True
                     self.thread_id = fallback[0]
                     self.status = "running"
                     self._persist()
-                    return self._result(
-                        "snapshot",
-                        message="运行进程仍在组件实现内部；等待下一个 Native RPA 组件断点。",
-                    )
+                    time.sleep(0.15)
+                    continue
             except Exception as exc:
                 last_error = str(exc)
-                if (_is_terminal_debug_error(last_error) or self.dap_terminal_event) and self._mark_terminal_if_needed(
-                    last_error
-                ):
+                if self._mark_terminal_if_needed(last_error):
                     return self._result(
                         "snapshot",
                         message=(
@@ -1113,7 +1351,12 @@ class NativeDebugSession:
         if last_error:
             self.error = last_error
         self._persist()
-        return self._result("snapshot", message="等待调试器停在组件位置超时；请调用 status 查看运行线程和错误信息。")
+        message = (
+            "运行进程仍在组件实现内部；等待下一个 Native RPA 组件断点超时。"
+            if component_internal_frame_seen
+            else "等待调试器停在组件位置超时；请调用 status 查看运行线程和错误信息。"
+        )
+        return self._result("snapshot", message=message)
 
     def _map_frame(self, frame: dict[str, Any]) -> dict[str, Any]:
         source = frame.get("source") if isinstance(frame.get("source"), dict) else {}
@@ -1290,7 +1533,7 @@ class NativeDebugSession:
                 snapshot = self._snapshot(wait_seconds=max(1.0, min(5.0, deadline - time.monotonic())))
                 snapshot = self._advance_to_start(
                     snapshot,
-                    max(1.0, min(5.0, deadline - time.monotonic())),
+                    max(1.0, min(30.0, deadline - time.monotonic())),
                 )
                 snapshot = self._require_paused(snapshot, "复用设计器调试会话")
                 snapshot["operation"] = "start"
@@ -1347,10 +1590,32 @@ class NativeDebugSession:
         self.run_started_at = time.time()
         self._persist()
 
+        try:
+            use_designer_controller = _active_designer_arrangement(self.client) == self.arrangement_id
+        except Exception:
+            use_designer_controller = False
+        if use_designer_controller:
+            _clear_designer_temp_breakpoints(self.client, self.arrangement_id)
+
         def run_worker() -> None:
             try:
-                self.run_result = _call_unlocked(run_client, "AppRunService", "run", [run_request])
+                if use_designer_controller:
+                    self.run_result = call_active_editor_renderer(
+                        self.client,
+                        "DebugControllerService",
+                        "startDebug",
+                        [False],
+                        acquire_lock=False,
+                    )
+                else:
+                    self.run_result = _call_unlocked(run_client, "AppRunService", "run", [run_request])
             except Exception as exc:
+                if use_designer_controller and "Native UI call timed out" in str(exc):
+                    # startDebug awaits the complete native run. A transport
+                    # timeout only means the debug run is still in progress.
+                    self.run_result = {"state": "in_flight", "transport_timeout": True}
+                    self._persist()
+                    return
                 self.run_error = str(exc)
                 if self.status not in {"stopped", "succeeded"}:
                     self.status = "runtime_error"
@@ -1358,6 +1623,8 @@ class NativeDebugSession:
 
         self.run_thread = threading.Thread(target=run_worker, name="shizai-native-debug-run", daemon=True)
         self.run_owned = True
+        if use_designer_controller:
+            self.adapter_mode = "designer_reused"
         self.run_thread.start()
 
         # AppRunService.run publishes an app-run event.  If the package editor
@@ -1379,10 +1646,13 @@ class NativeDebugSession:
         if self._wait_for_existing_adapter(deadline, max_seconds=post_run_probe_seconds):
             try:
                 self._set_breakpoints()
+                # A readable designer-owned adapter has already completed its
+                # DAP attach lifecycle. configurationDone is not idempotent in
+                # debugpy 1.5 and sending it again closes the message stream.
                 snapshot = self._snapshot(wait_seconds=max(1.0, min(5.0, deadline - time.monotonic())))
                 snapshot = self._advance_to_start(
                     snapshot,
-                    max(1.0, min(5.0, deadline - time.monotonic())),
+                    max(1.0, min(30.0, deadline - time.monotonic())),
                 )
                 snapshot = self._require_paused(snapshot, "设计器接管调试会话")
                 snapshot["operation"] = "start"
@@ -1456,15 +1726,13 @@ class NativeDebugSession:
                         daemon=True,
                     )
                     attach_thread.start()
-                    # Give the worker time to put attach on the desktop RPC
-                    # channel before the following DAP requests are submitted.
-                    attach_done.wait(0.05)
-                    # The designer's Initialized-event handler installs the
-                    # component breakpoints before configurationDone.  A DAP
-                    # next request without these breakpoints only steps Python
-                    # lines and is not a component-level debugger.
+                    # The designer's Initialized-event handler may complete the
+                    # attach lifecycle itself. Wait briefly for that path before
+                    # deciding whether MCP must send configurationDone.
+                    attach_done.wait(max(0.05, min(1.0, deadline - time.monotonic())))
                     self._set_breakpoints()
-                    self._debug("configurationDone")
+                    if not attach_done.is_set():
+                        self._debug("configurationDone")
                     # The installed designer does not promise that the RPC
                     # carrying ``attach`` resolves before the first stopped
                     # event.  ConfigurationDone completes the DAP lifecycle;
@@ -1479,7 +1747,7 @@ class NativeDebugSession:
                     snapshot = self._snapshot(wait_seconds=max(1.0, min(5.0, deadline - time.monotonic())))
                     snapshot = self._advance_to_start(
                         snapshot,
-                        max(1.0, min(5.0, deadline - time.monotonic())),
+                        max(1.0, min(30.0, deadline - time.monotonic())),
                     )
                     snapshot = self._require_paused(snapshot, "MCP 自建调试会话")
                     snapshot["operation"] = "start"
@@ -1536,13 +1804,30 @@ class NativeDebugSession:
                 result["preflight"] = preflight
                 result["preflight_blocked"] = True
                 return result
+            if self.adapter_mode == "designer_reused" and isinstance(self.client, ShizaiDesktopAgent):
+                if operation == "next":
+                    return self._designer_component_next(
+                        wait_seconds,
+                        previous_component=previous_component,
+                        previous_sequence=previous_sequence,
+                    )
+                return self._designer_command(
+                    operation,
+                    wait_seconds,
+                    previous_component=previous_component,
+                    previous_sequence=previous_sequence,
+                )
             # Component-level ``next`` must never rely solely on a later
             # breakpoint. A DAP ``continue`` can execute the following
             # component when that breakpoint is stale or is not resolved by
             # the packaged debug adapter. Step over generated Python lines and
             # accept completion only at the exact next component call site.
             dap_operation = operation
+            command_deadline = time.monotonic() + max(0.1, wait_seconds)
             for _ in range(attempts):
+                remaining = command_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 self.status = "running"
                 self._persist()
                 try:
@@ -1561,7 +1846,7 @@ class NativeDebugSession:
                             ),
                         )
                     raise
-                result = self._wait_after_command(operation, wait_seconds)
+                result = self._wait_after_command(operation, remaining)
                 current_component = (result.get("current") or {}).get("component_id")
                 if operation != "next":
                     return result
@@ -1594,18 +1879,36 @@ class NativeDebugSession:
                         None,
                     )
                     if previous_record and self.last_line > int(previous_record.get("line") or 0):
+                        self.status = "running"
+                        self._persist()
+                        self._debug_async("continue", {"threadId": self.thread_id})
+                        result = self._wait_after_command(
+                            operation,
+                            max(0.1, command_deadline - time.monotonic()),
+                        )
                         result["component_completed"] = True
                         result["completed_component_id"] = previous_component
-                        result["flow_tail_pending"] = True
+                        result["flow_tail_pending"] = result.get("status") not in {
+                            "runtime_error",
+                            "succeeded",
+                            "stopped",
+                        }
                         if previous_component:
                             result["runtime_verification"] = {
                                 "verified": True,
                                 "component_executed": True,
                                 "component_id": previous_component,
                                 "component_sequence": previous_sequence,
-                                "evidence_kind": "dap_component_boundary",
+                                "evidence_kind": (
+                                    "designer_terminal_state"
+                                    if result.get("status") == "succeeded"
+                                    else "dap_component_boundary"
+                                ),
                             }
-                        result["message"] = "已执行最后一个组件并停在流程尾部；没有继续发送可能跨出流程的调试命令。"
+                        if result.get("status") == "succeeded":
+                            result["message"] = "已执行最后一个组件，Native RPA 运行和设计器调试状态均已结束。"
+                        else:
+                            result["message"] = "已执行最后一个组件；流程收尾仍在进行，请调用 status 查看。"
                         return result
                 if (
                     result.get("status") == "paused"
@@ -1618,6 +1921,8 @@ class NativeDebugSession:
                     )
                 ):
                     if previous_component:
+                        result["component_completed"] = True
+                        result["completed_component_id"] = previous_component
                         result["runtime_verification"] = {
                             "verified": True,
                             "component_executed": True,
@@ -1627,6 +1932,287 @@ class NativeDebugSession:
                         }
                     return result
             return result
+
+    def _designer_component_next(
+        self,
+        wait_seconds: float,
+        *,
+        previous_component: Any,
+        previous_sequence: Any,
+    ) -> dict[str, Any]:
+        """Run exactly one component using the next generated boundary as a stop."""
+        records = _component_records(_position_records(self.project_dir, self.task_path))
+        target = next(
+            (
+                record
+                for record in records
+                if isinstance(previous_sequence, int) and int(record.get("ordinal") or 0) == previous_sequence + 1
+            ),
+            None,
+        )
+        target_lines = [int(target["line"])] if target is not None else []
+        self._set_breakpoint_lines(target_lines)
+        self.breakpoint_lines = target_lines
+        self._persist()
+
+        # The native stack-frame service automatically issues more DAP `next`
+        # calls when its generated-code map says two lines belong to the same
+        # component. MCP-written flows can temporarily leave that map stale.
+        # Clearing only its presentation cache lets the explicit next boundary
+        # become the new current frame without disconnecting the shared adapter.
+        call_active_editor_renderer(
+            self.client,
+            "DebugStackFrameService",
+            "dispose",
+        )
+        self.status = "running"
+        self._persist()
+        self._debug_async("continue", {"threadId": self.thread_id})
+        result = self._wait_for_designer_boundary(
+            wait_seconds,
+            target=target,
+        )
+
+        current = result.get("current") if isinstance(result.get("current"), dict) else {}
+        reached_target = bool(
+            target is not None
+            and result.get("status") == "paused"
+            and current.get("component_boundary") is True
+            and current.get("component_id") == target.get("component_id")
+        )
+        if target is not None and not reached_target:
+            if result.get("status") in {"succeeded", "stopped"}:
+                self.status = "runtime_error"
+                self.error = (
+                    f"single-step boundary was missed: expected component {target.get('component_id')} "
+                    f"after {previous_component}, but the runtime terminated"
+                )
+                self._persist()
+                result = self._result("next", message=self.error)
+            result["single_step_boundary_missed"] = True
+            result["expected_component_id"] = target.get("component_id")
+            return result
+
+        result["component_completed"] = True
+        result["completed_component_id"] = previous_component
+        result["runtime_verification"] = {
+            "verified": True,
+            "component_executed": True,
+            "component_id": previous_component,
+            "component_sequence": previous_sequence,
+            "evidence_kind": "dap_next_component_breakpoint" if target is not None else "designer_terminal_state",
+        }
+        if reached_target:
+            result["message"] = "已执行一个组件，并准确停在下一个 Native RPA 组件边界。"
+        elif result.get("status") == "succeeded":
+            result["message"] = "已执行最后一个组件，Native RPA 运行和设计器调试状态均已结束。"
+        return result
+
+    def _wait_for_designer_boundary(
+        self,
+        wait_seconds: float,
+        *,
+        target: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Observe the designer's cached frame without competing for its DAP socket."""
+        deadline = time.monotonic() + max(0.1, wait_seconds)
+        last_state: str | None = None
+        last_error: str | None = None
+        expected_line = int(target["line"]) if target is not None else None
+        while time.monotonic() < deadline:
+            try:
+                async_error = self._consume_async_debug_error()
+                last_state = str(
+                    _unwrap(call_active_editor_renderer(self.client, "DebugControllerService", "getDebugState"))
+                    or ""
+                ).casefold()
+                if last_state in {"idle", "terminaled"}:
+                    debugging = bool(
+                        _unwrap(
+                            call_active_editor_renderer(
+                                self.client,
+                                "DebugControllerService",
+                                "getIsDebugging",
+                            )
+                        )
+                    )
+                    if not debugging:
+                        evidence = self._runtime_error_from_logs()
+                        if evidence:
+                            self._mark_runtime_error(str(evidence.get("message") or "运行错误"), evidence)
+                        else:
+                            self.dap_terminal_event = "terminated"
+                            self.status = "succeeded"
+                            self.run_owned = False
+                            self.error = None
+                            self._persist()
+                        return self._result("next", message="Native RPA 运行已结束，设计器已退出调试状态。")
+                if last_state == "stopped":
+                    raw_frame = _unwrap(
+                        call_active_editor_renderer(
+                            self.client,
+                            "DebugStackFrameService",
+                            "getCurrentStackFrame",
+                        )
+                    )
+                    frame = raw_frame if isinstance(raw_frame, dict) else None
+                    if frame is not None and self._is_flow_frame(frame):
+                        line = int(frame.get("line") or 0)
+                        # A late event from the previous pause must not satisfy
+                        # the next-component boundary we just installed.
+                        if expected_line is None or line == expected_line:
+                            self.current = self._map_frame(frame)
+                            self.last_line = line or self.last_line
+                            self.status = "paused"
+                            self.error = None
+                            self._persist()
+                            return self._result("next")
+                if async_error:
+                    raise ShizaiCloudError(async_error)
+            except Exception as exc:
+                last_error = str(exc)
+                if self._mark_terminal_if_needed(last_error):
+                    return self._result("next", message="Native RPA 运行已结束，未继续等待 DAP 响应。")
+            time.sleep(0.1)
+        self.status = "running"
+        self.error = last_error
+        self._persist()
+        return self._result(
+            "next",
+            message=f"等待设计器组件边界超时；最后调试状态为 {last_state or 'unknown'}。",
+        )
+
+    def _designer_command(
+        self,
+        operation: str,
+        wait_seconds: float,
+        *,
+        previous_component: Any,
+        previous_sequence: Any,
+    ) -> dict[str, Any]:
+        """Delegate one action to the designer and observe its state machine."""
+        method = {
+            "continue": "continue",
+            "next": "next",
+            "stepIn": "stepIn",
+            "stepOut": "stepOut",
+        }[operation]
+        self.status = "running"
+        self._persist()
+        control_done = threading.Event()
+        control_errors: list[str] = []
+
+        def control_worker() -> None:
+            try:
+                call_active_editor_renderer(
+                    self.client,
+                    "DebugControllerService",
+                    method,
+                    acquire_lock=False,
+                )
+            except Exception as exc:
+                control_errors.append(str(exc))
+            finally:
+                control_done.set()
+
+        threading.Thread(
+            target=control_worker,
+            name=f"shizai-designer-debug-{method}",
+            daemon=True,
+        ).start()
+        deadline = time.monotonic() + max(0.1, wait_seconds)
+        last_state: str | None = None
+        while time.monotonic() < deadline:
+            try:
+                last_state = str(
+                    _unwrap(call_active_editor_renderer(self.client, "DebugControllerService", "getDebugState")) or ""
+                ).casefold()
+                current_component = _unwrap(
+                    call_active_editor_renderer(
+                        self.client,
+                        "DebugControllerService",
+                        "getDebugComponentIdSync",
+                    )
+                )
+                if last_state == "stopped" and (
+                    operation != "next"
+                    or not previous_component
+                    or (bool(current_component) and current_component != previous_component)
+                ):
+                    record = next(
+                        (
+                            item
+                            for item in _component_records(_position_records(self.project_dir, self.task_path))
+                            if item.get("component_id") == current_component
+                        ),
+                        None,
+                    )
+                    if record is not None:
+                        self.current = {
+                            "frame_id": None,
+                            "function": "main",
+                            "line": int(record["line"]),
+                            "column": 1,
+                            "source": str(_generated_module(self.project_dir, self.task_path)),
+                            "component_boundary": True,
+                            "component_id": record.get("component_id"),
+                            "component_sequence": record.get("ordinal"),
+                            "component_type": str(record.get("function") or "").replace(".", "_", 1),
+                            "component_function": record.get("function"),
+                            "component_label": record.get("label"),
+                            "arrangement_id": self.arrangement_id,
+                        }
+                        self.last_line = int(record["line"])
+                        self.status = "paused"
+                        self.error = None
+                        self._persist()
+                        result = self._result(operation)
+                        if previous_component:
+                            result["component_completed"] = True
+                            result["completed_component_id"] = previous_component
+                            result["runtime_verification"] = {
+                                "verified": True,
+                                "component_executed": True,
+                                "component_id": previous_component,
+                                "component_sequence": previous_sequence,
+                                "evidence_kind": "designer_component_boundary",
+                            }
+                        return result
+                if last_state in {"idle", "terminaled"}:
+                    self.dap_terminal_event = "terminated"
+                    self._mark_terminal_if_needed()
+                    if self.status not in {"runtime_error", "succeeded"}:
+                        self.status = "succeeded"
+                        self.error = None
+                    self.run_owned = False
+                    self._persist()
+                    result = self._result(
+                        operation,
+                        message="Native RPA 运行已结束，设计器已确认 terminaled。",
+                    )
+                    if previous_component:
+                        result["component_completed"] = True
+                        result["completed_component_id"] = previous_component
+                        result["runtime_verification"] = {
+                            "verified": True,
+                            "component_executed": True,
+                            "component_id": previous_component,
+                            "component_sequence": previous_sequence,
+                            "evidence_kind": "designer_terminal_state",
+                        }
+                    return result
+            except Exception as exc:
+                if self._mark_terminal_if_needed(str(exc)):
+                    return self._result(operation)
+            if control_done.is_set() and control_errors and last_state not in {"running", "stopped"}:
+                raise ShizaiCloudError(control_errors[-1])
+            time.sleep(0.1)
+        self.status = "running"
+        self._persist()
+        return self._result(
+            operation,
+            message=f"等待设计器完成单步超时；最后调试状态为 {last_state or 'unknown'}。",
+        )
 
     def _wait_after_command(self, operation: str, wait_seconds: float) -> dict[str, Any]:
         old_line = self.last_line
@@ -1685,6 +2271,7 @@ class NativeDebugSession:
         stop_attempted = False
         stop_acknowledged = False
         disconnect_attempted = False
+        designer_stop: dict[str, Any] | None = None
         self.status = "stopping"
         self._persist()
 
@@ -1693,7 +2280,15 @@ class NativeDebugSession:
         # service waiting on the run and turn a normal stop into a long RPC
         # timeout.  DAP disconnect remains best-effort and is always attempted
         # after the official run-stop request.
-        if self.run_owned:
+        if self.adapter_mode == "designer_reused":
+            try:
+                designer_stop = _stop_designer_debug_controller(self.client, self.arrangement_id)
+                if designer_stop is not None:
+                    stop_attempted = bool(designer_stop.get("stop_requested"))
+                    stop_acknowledged = True
+            except Exception as exc:
+                errors.append(str(exc))
+        if self.run_owned and designer_stop is None:
             stop_attempted = True
             try:
                 self._rpc("AppRunService", "stop", [{}])
@@ -1704,12 +2299,22 @@ class NativeDebugSession:
                 else:
                     stop_acknowledged = True
         try:
-            adapter_alive = not already_terminal and not self.runtime_error_evidence
-            if adapter_alive and (self.port or self.adapter_mode == "designer_reused"):
+            # A failed designer takeover still owns the designer's shared DAP
+            # connection even though the local session is marked runtime_error.
+            # Disconnect it so the next project does not keep probing a stale
+            # adapter until its start timeout expires.
+            adapter_alive = (
+                not self.runtime_error_evidence
+                and not self.dap_terminal_event
+                and (not already_terminal or self.adapter_mode == "designer_reused")
+            )
+            if designer_stop is None and adapter_alive and (self.port or self.adapter_mode == "designer_reused"):
                 disconnect_attempted = True
                 self._debug("disconnect")
         except Exception as exc:
             errors.append(str(exc))
+        if not errors:
+            self.run_owned = False
         self.status = "cleanup_timeout" if errors else "stopped"
         if errors:
             self.error = "; ".join(errors) if not self.error else f"{self.error}; cleanup failed: {'; '.join(errors)}"
@@ -1725,6 +2330,7 @@ class NativeDebugSession:
                 "stop_attempted": stop_attempted,
                 "stop_acknowledged": stop_acknowledged,
                 "disconnect_attempted": disconnect_attempted,
+                "designer_stop": designer_stop,
                 "retryable": bool(errors),
                 "next_tool": "shizai_rpa_debug_stop" if errors else None,
                 "terminal_cleanup_state": self.status,
@@ -1798,9 +2404,10 @@ class NativeDebugSession:
             name="shizai-native-debug-reconnect-attach",
             daemon=True,
         ).start()
-        attach_done.wait(0.05)
+        attach_done.wait(max(0.05, min(1.0, wait_seconds)))
         self._set_breakpoints()
-        self._debug("configurationDone")
+        if not attach_done.is_set():
+            self._debug("configurationDone")
         attach_done.wait(max(0.25, min(1.0, wait_seconds)))
         if attach_error:
             raise ShizaiCloudError(str(attach_error[0])) from attach_error[0]
@@ -1838,6 +2445,20 @@ def debug_start(
 ) -> dict[str, Any]:
     """Start design-time validation at the requested component number."""
     project_dir = _resolve_project(paths, project_ref)
+    from . import project as project_core
+
+    editor_block = project_core._unsaved_editor_block(project_dir, client)
+    if editor_block is not None:
+        editor_block["ui_feedback"] = set_rpa_ui_feedback(
+            "debug_blocked",
+            "design_validation",
+            "designer 画布有未保存改动，未启动设计验证；先保存再继续。",
+            animation="native_rpa_blocked",
+            flow_ref=str(project_dir),
+            status="blocked",
+            failure_kind="editor_unsaved_changes",
+        )
+        return editor_block
     set_rpa_ui_feedback(
         "debug_starting",
         "design_validation",
@@ -2137,12 +2758,17 @@ def debug_capabilities(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
     with _SESSIONS_LOCK:
         session = _SESSIONS.get(str(project_dir))
     persisted = _read_json(_state_path(paths, project_dir)) or {}
+    persisted_status = str(persisted.get("status") or "").strip().casefold()
     persisted_active = bool(
         persisted.get("status") not in {None, *_TERMINAL_SESSION_STATUSES}
     )
     active = (
         bool(session and session.status not in _TERMINAL_SESSION_STATUSES)
         or persisted_active
+    )
+    cleanup_required = bool(
+        persisted.get("run_owned")
+        and persisted_status not in {"", "stopped", "succeeded"}
     )
     port, port_mtime = _read_port_info(paths)
     return {
@@ -2158,6 +2784,9 @@ def debug_capabilities(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
         "generated_position_count": len(positions),
         "ready": bool(component_ids and positions),
         "active_session": active,
+        "session_status": persisted_status or None,
+        "run_owned": bool(persisted.get("run_owned")),
+        "cleanup_required": cleanup_required,
         "live_connection": bool(
             session and session.status not in _TERMINAL_SESSION_STATUSES
         ),
@@ -2193,6 +2822,9 @@ def debug_capabilities(paths: ShizaiPaths, project_ref: str) -> dict[str, Any]:
             },
         },
         "next_action": (
+            {"tool": "shizai_rpa_debug_stop", "reason": "失败的设计验证仍持有运行会话，必须先完成清理。"}
+            if cleanup_required
+            else
             {"tool": "shizai_rpa_debug_status", "reason": "已有活动会话，读取当前停靠组件后再执行下一步。"}
             if active
             else {"tool": "shizai_rpa_debug_start", "reason": "先启动或接管 Native DAP，会话启动后再使用组件级单步。"}
@@ -2274,19 +2906,35 @@ def debug_stop(paths: ShizaiPaths, project_ref: str, *, client: Any | None = Non
         project_dir = _resolve_project(paths, project_ref)
         persisted = _read_json(_state_path(paths, project_dir)) or {}
         was_stopped = persisted.get("status") == "stopped"
+        run_was_owned = bool(persisted.get("run_owned"))
         errors: list[str] = []
         stop_attempted = False
         stop_acknowledged = False
-        if persisted.get("run_owned"):
+        caller = client or ShizaiDesktopAgent()
+        designer_stop: dict[str, Any] | None = None
+        if persisted.get("adapter_mode") == "designer_reused":
+            try:
+                designer_stop = _stop_designer_debug_controller(
+                    caller,
+                    str(persisted.get("arrangement_id") or "").strip() or None,
+                )
+                if designer_stop is not None:
+                    stop_attempted = bool(designer_stop.get("stop_requested"))
+                    stop_acknowledged = True
+            except Exception as exc:
+                errors.append(str(exc))
+        if run_was_owned and designer_stop is None:
             stop_attempted = True
             try:
-                (client or ShizaiDesktopAgent()).call("AppRunService", "stop", [{}])
+                caller.call("AppRunService", "stop", [{}])
                 stop_acknowledged = True
             except Exception as exc:
                 if _app_run_already_stopped(exc):
                     stop_acknowledged = True
                 else:
                     errors.append(str(exc))
+        if not errors:
+            persisted["run_owned"] = False
         persisted.update(
             {
                 "kind": "native_rpa_debug_session",
@@ -2296,13 +2944,14 @@ def debug_stop(paths: ShizaiPaths, project_ref: str, *, client: Any | None = Non
                 "project_ref": str(project_dir),
                 "status": "cleanup_timeout" if errors else "stopped",
                 "stopped": not errors,
-                "already_stopped": was_stopped and not persisted.get("run_owned"),
+                "already_stopped": was_stopped and not run_was_owned,
                 "cleanup_complete": not errors,
                 "cleanup_status": "complete" if not errors else "timeout",
                 "errors": errors,
                 "stop_attempted": stop_attempted,
                 "stop_acknowledged": stop_acknowledged,
                 "disconnect_attempted": False,
+                "designer_stop": designer_stop,
                 "retryable": bool(errors),
                 "next_tool": "shizai_rpa_debug_stop" if errors else None,
                 "terminal_cleanup_state": "cleanup_timeout" if errors else "stopped",

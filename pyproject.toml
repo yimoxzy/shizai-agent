@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shizai-agent"
-version = "0.7.27"
+version = "0.7.32"
 description = "Local CLI and MCP bridge for the Shizai Intelligent desktop application"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ dependencies = [
     "psutil>=5.9,<8",
     "requests>=2.31,<3",
     "websocket-client>=1.7,<2",
+    "websockets>=11,<12",
 ]
 
 [project.optional-dependencies]

@@ -103,9 +103,15 @@ def read_edit_context(paths: Any, flow_ref: str, *, step_id: str | None = None) 
         if not isinstance(node, dict) or step_id == "MAIN_COMPONENT":
             raise WorkflowEditError("step_not_found", "目标步骤不存在，请从 steps 中选择稳定 id。", step_id=step_id)
         component = str(node.get("type") or "")
+        declared_element_ids = node.get("mcpElementIds")
+        if isinstance(declared_element_ids, list):
+            element_ids = [str(item).strip() for item in declared_element_ids if str(item).strip()]
+        else:
+            element_ids = project._native_element_ids_from_node(node)
         result["selected_step"] = {
             "id": step_id, "component": component,
             "parameter_edit_supported": step_id in order,
+            "element_ids": element_ids,
             "native_parameters": native_parameters(node),
             "contract": project._live_rpa_contract(paths, component),
         }

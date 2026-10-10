@@ -163,8 +163,9 @@ shizai_rpa_analyze_request
 -> shizai_rpa_component_catalog
 -> shizai_rpa_validate_plan
 -> shizai_rpa_start_design(open_browser=false)
--> shizai_rpa_open_browser
--> shizai_rpa_scan_page(project_ref, step_id)
+-> shizai_rpa_open_browser (opens the saved URL for binding; runtime_verified=false)
+-> shizai_rpa_capture_windows(project_ref)
+-> shizai_rpa_scan_page(project_ref)
 -> optional shizai_extension_start_capture(project_ref, step_id)
 -> shizai_rpa_capture_elements(project_ref, step_id)
 -> shizai_rpa_validate_step

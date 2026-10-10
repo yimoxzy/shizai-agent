@@ -2,6 +2,7 @@
 
 import csv
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ def csv_bytes(rows):
 
 def test_pack_oracles_and_reference_non_matches():
     result = bench.validate_pack()
-    assert result["cases"] == 32 and result["turns"] == 64
+    assert result["cases"] == 34 and result["turns"] == 68
     facts = {"resource": "product_listing", "operation": "collect"}
     assert bench.references({**facts, "site": "jd.com"}) == bench.references({**facts, "site": "another-shop"})
     assert not bench.references({"resource": "text_file", "operation": "collect", "site": "jd.com"})
@@ -68,6 +69,60 @@ def test_fixture_handles_overlap_more_layout_frames_and_hides_absent_sales():
     assert "<article>" in render("/shop", {"q": "耳机", "layout": "cards"})
     assert "<iframe" in render("/frame", {})
     assert "请登录" in render("/gate", {})
+
+
+def test_native_flow_contract_checks_required_component_and_collection_mode():
+    collection_node = {
+        "collect": {
+            "type": "WebBrowser_DataCollectionV5",
+            "args0": [{
+                "name": "config",
+                "value": json.dumps({
+                    "collectionConfig": {
+                        "tableSelector": [{"name": "table"}],
+                        "columnConfigArray": [{"columnHeader": "商品链接", "dataAttrName": "href"}],
+                    }
+                }),
+            }],
+        }
+    }
+    spec = {"native_flow": {
+        "required_components": ["WebBrowser_DataCollectionV5"],
+        "forbid_table_href": True,
+    }}
+
+    assert bench.native_flow_contract(collection_node, spec) is False
+    collection_node["collect"]["args0"][0]["value"] = json.dumps({
+        "collectionConfig": {
+            "tableSelector": [],
+            "columnConfigArray": [{"columnHeader": "商品链接", "dataAttrName": "href"}],
+        }
+    })
+    assert bench.native_flow_contract(collection_node, spec) is True
+    collection_node["collect"]["args0"][0]["value"] = json.dumps({
+        "collectionConfig": {
+            "tableSelector": [{"name": "table"}],
+            "columnConfigArray": [{"columnHeader": "商品名称", "dataAttrName": "innerText"}],
+        }
+    })
+    assert bench.native_flow_contract(collection_node, spec) is True
+    assert bench.native_flow_contract({}, spec) is False
+
+
+@pytest.mark.parametrize("config", ["{broken", None, {}, {"collectionConfig": {}}])
+def test_native_flow_contract_rejects_unreadable_collection_config(config):
+    nodes = {
+        "collect": {
+            "type": "WebBrowser_DataCollectionV5",
+            "args0": [{"name": "config", "value": config}],
+        }
+    }
+    spec = {"native_flow": {
+        "required_components": ["WebBrowser_DataCollectionV5"],
+        "forbid_table_href": True,
+    }}
+
+    assert bench.native_flow_contract(nodes, spec) is False
 
 
 def test_preparation_keeps_oracles_out_of_model_prompts_and_cannot_overwrite(tmp_path, monkeypatch):

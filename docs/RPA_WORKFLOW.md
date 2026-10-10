@@ -54,6 +54,8 @@ shizai_route_intent(query)
 
 使用 `WebBrowser_RunJsInIeBySelector_v3` 时，客户端模型必须提供当前页面专属的 `jsCode`、`output_variable` 和 `result_mode`。脚本必须保留 `SHIZAI_WAITING_FOR_USER:login_required` 与 `SHIZAI_WAITING_FOR_USER:page_challenge` 两个暂停标记。MCP 不提供默认网页脚本。
 
+如果 DeepCapture 能识别 Chrome 窗口但没有暴露 Document，自动 selector 扫描不可用。此时 MCP 会返回两个明确分支：全自动任务先读取并评估 `WebBrowser_RunJsInIeBySelector_v3` 的实时契约；只有用户愿意在页面点击目标元素时，才启动 `shizai_extension_start_capture` 官方拾取。启动拾取层本身不表示元素已经捕获。
+
 ## 3. 预检计划并创建真实应用
 
 需要时调用只读薄预检：
@@ -91,7 +93,7 @@ shizai_route_intent(query)
 - 把原始分析与完整计划持久化到 `szrpa.json`；
 - `flow_ref` 和 `project_ref` 指向该应用目录；
 - 发布“流程设计完成，准备开始实际操作”状态；
-- 不执行浏览器 I/O。随后仅在计划包含需要恢复浏览器目标的步骤时调用 `shizai_rpa_open_browser`；该调用才播放 5 秒原生接管倒计时、执行计划中的导航步骤并初始化不带红色拾取层的 DeepCapture。
+- 不执行浏览器 I/O。随后仅在计划包含需要恢复浏览器目标的步骤时调用 `shizai_rpa_open_browser`；该调用播放首次接管提示，从已保存导航步骤读取 URL，在当前 Chrome 配置中打开真实页面并初始化不带红色拾取层的 DeepCapture。此时 `runtime_verified=false`，原生导航节点仍需在绑定完成后用设计态调试验证。
 
 `open_browser=false` 是默认值。计划配置传语义 JSON 值，例如 `url: "https://example.com"`，不要把目录里的 native 引号编码复制为字符串内容。
 

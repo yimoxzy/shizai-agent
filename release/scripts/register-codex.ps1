@@ -39,7 +39,7 @@ if ($content) {
 }
 
 $escapedName = [Regex]::Escape($serverName)
-$sectionPattern = "(?ms)^\[mcp_servers\.$escapedName\]\r?\n.*?(?=^\[|\z)"
+$sectionPattern = "(?ms)^\[mcp_servers\.$escapedName\]\r?\n.*?(?=^\[(?!mcp_servers\.$escapedName(?:\.|\]))|\z)"
 $content = [Regex]::Replace($content, $sectionPattern, '').TrimEnd()
 $tomlPath = $resolvedMcp.Replace("'", "''")
 $section = @"
@@ -47,17 +47,24 @@ $section = @"
 [mcp_servers.$serverName]
 command = '$tomlPath'
 args = []
+enabled = true
 startup_timeout_sec = 30
 tool_timeout_sec = 120
 omit_tools_from = ["deferred"]
+
+[mcp_servers.$serverName.env]
+SHIZAI_MCP_TOOL_PROFILE = "rpa-authoring"
 "@
 
 [IO.File]::WriteAllText($ConfigPath, ($content + $section + "`r`n"), [Text.UTF8Encoding]::new($false))
 
 [pscustomobject]@{
     registered = $true
+    verified = $true
     server = $serverName
     command = $resolvedMcp
     config = $ConfigPath
+    tool_profile = 'rpa-authoring'
+    restart_required = $true
     note = 'Codex may show Auth: Unsupported for local stdio MCP servers; Shizai authentication comes from the signed-in desktop designer.'
 } | ConvertTo-Json -Depth 3
