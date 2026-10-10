@@ -9466,6 +9466,13 @@ def test_mcp_open_browser_uses_saved_manual_component_url(monkeypatch, planned_u
     if planned_url:
         flow["component_plan"] = [{**node, "config": {"url": planned_url}}]
     monkeypatch.setattr(mcp_server.project_core, "read_rpa_flow", lambda *_args: {"flow": flow})
+    class UnavailableBridge:
+        def call(self, method, params, *, timeout):
+            assert method == "open_design_tab"
+            assert params["url"] == "https://www.example.test/search"
+            return {"opened": False, "owned": False}
+
+    monkeypatch.setattr(mcp_server, "_browser_bridge_manager", lambda: UnavailableBridge())
     opened = []
     monkeypatch.setattr(mcp_server, "open_current_chrome", lambda url, **_kwargs: opened.append(url) or {"opened": True})
 

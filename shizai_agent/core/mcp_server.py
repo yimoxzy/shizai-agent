@@ -13,6 +13,7 @@ import socket
 import sys
 import time
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
@@ -316,10 +317,32 @@ def _rpa_cleanup_native_ui(client: ShizaiDesktopAgent | None = None) -> dict[str
             result[key] = action()
         except Exception as exc:
             result[f"{key}_warning"] = str(exc)
+    result["cleanup_complete"] = all(
+        isinstance(result.get(key), dict)
+        and result[key].get("visible") is False
+        and not result[key].get("close_warning")
+        for key in ("small_card", "takeover_frame", "native_mask")
+    ) and (result.get("inspect") or {}).get("overlay_state") == "inactive"
     _ACTIVE_RPA_DESIGN_UI.clear()
     _LATEST_RPA_DESIGN_REF = None
-    _RPA_SMALL_CARD_OPEN = False
+    _RPA_SMALL_CARD_OPEN = (result.get("small_card") or {}).get("visible") is not False
     return result
+
+
+def _attach_ui_cleanup_state(result: dict[str, Any], cleanup: dict[str, Any]) -> None:
+    """Keep run completion distinct from unconfirmed desktop UI cleanup."""
+    complete = cleanup.get("cleanup_complete")
+    if complete is None:
+        return
+    result["ui_cleanup_complete"] = complete
+    if not complete:
+        feedback = dict(result.get("ui_feedback") or {})
+        feedback.update({
+            "phase": "cleanup_pending",
+            "overlay_state": "unknown",
+            "message": "运行状态与界面清理分开确认；部分遮罩关闭未获确认，请重试停止操作。",
+        })
+        result["ui_feedback"] = feedback
 
 
 def _rpa_cleanup_stale_design_ui(client: ShizaiDesktopAgent) -> dict[str, Any]:
@@ -2049,7 +2072,15 @@ def _dispatch_impl(name: str, args: dict[str, Any]) -> Any:
             raise PermissionError("shizai_extension_stop_capture requires allow_write: true")
         bridge = ShizaiExtensionBridge(desktop=client)
         try:
-            result = bridge.stop_capture(package_path=args.get("project_ref"))
+            project_ref = args.get("project_ref")
+            if project_ref:
+                package_path = Path(str(project_ref)).expanduser()
+                # Cleanup must still work after the owning project was removed.
+                project_ref = str(
+                    package_path.resolve() if package_path.is_absolute()
+                    else project_core.resolve_project(paths, str(project_ref))
+                )
+            result = bridge.stop_capture(package_path=project_ref)
         except Exception:
             try:
                 NativeMask(client=client).close(force=True)
@@ -3078,6 +3109,7 @@ def _dispatch_impl(name: str, args: dict[str, Any]) -> Any:
                 native_ui = {}
                 result["native_ui"] = native_ui
             native_ui["final_cleanup"] = cleanup
+            _attach_ui_cleanup_state(result, cleanup)
         return result
     if name == "shizai_rpa_validate_flow":
         flow_ref = str(args["flow_ref"])
@@ -3577,6 +3609,8 @@ def _dispatch(name: str, args: dict[str, Any]) -> Any:
             native_ui = result.setdefault("native_ui", {})
             if isinstance(native_ui, dict):
                 native_ui["final_cleanup" if close_all else "progress_card_cleanup"] = cleanup
+                if close_all:
+                    _attach_ui_cleanup_state(result, cleanup)
 
 
 async def _dispatch_in_worker(name: str, arguments: dict[str, Any]) -> Any:

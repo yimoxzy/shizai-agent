@@ -320,7 +320,13 @@ def authoring_result(name: str, value: dict[str, Any], arguments: dict[str, Any]
             "runtime_evidence": runtime_evidence,
             "failure_kind": source.get("failure_kind") or nested_status.get("failure_kind"),
             "cleanup_status": source.get("cleanup_status") or nested_status.get("cleanup_status") or (nested_run.get("runtime_cleanup") or {}).get("status"),
-            "cleanup_complete": source.get("cleanup_complete") or nested_status.get("cleanup_complete"),
+            "cleanup_complete": (
+                source["cleanup_complete"] if "cleanup_complete" in source else nested_status.get("cleanup_complete")
+            ),
+            "ui_cleanup_complete": (
+                source["ui_cleanup_complete"]
+                if "ui_cleanup_complete" in source else nested_status.get("ui_cleanup_complete")
+            ),
             "interaction_required": source.get("interaction_required") or nested_status.get("interaction_required"),
             "interaction": source.get("interaction") or nested_status.get("interaction"),
             "ui_feedback": source.get("ui_feedback") or nested_status.get("ui_feedback"),

@@ -339,7 +339,11 @@ def _read_capture_session_state(package_path: str | Path) -> dict[str, Any] | No
     if not isinstance(payload, dict):
         return None
     started_at = payload.get("started_at")
-    if isinstance(started_at, (int, float)) and time.time() - float(started_at) > _CAPTURE_SESSION_STATE_TTL:
+    if (
+        not payload.get("cleanup_pending")
+        and isinstance(started_at, (int, float))
+        and time.time() - float(started_at) > _CAPTURE_SESSION_STATE_TTL
+    ):
         return None
     return payload
 
@@ -2528,6 +2532,9 @@ class ShizaiExtensionBridge:
                 "project_ref is required to initialize DeepCapture; pass the active flow/project path"
             )
         normalized = str(Path(value).expanduser().resolve())
+        persisted = _read_capture_session_state(normalized)
+        if persisted and persisted.get("cleanup_pending"):
+            raise ShizaiCloudError("拾取层清理未确认；请先重试 shizai_extension_stop_capture，再恢复页面读取。")
         with _CAPTURE_SESSION_LOCK:
             if _CAPTURE_SESSION_PACKAGE == normalized:
                 result = {
@@ -2626,7 +2633,8 @@ class ShizaiExtensionBridge:
                 "next_action": "workflow rpa-browser-session-start",
             }
         active = persisted.get("native_session_state") == "active_last_known"
-        inspect_started = bool(persisted.get("inspect_started")) and active
+        cleanup_pending = bool(persisted.get("cleanup_pending"))
+        inspect_started = bool(persisted.get("inspect_started")) and (active or cleanup_pending)
         return {
             "kind": "shizai_capture_session_status",
             "project_ref": normalized,
@@ -2635,8 +2643,10 @@ class ShizaiExtensionBridge:
             "active": active,
             "native_session_state": persisted.get("native_session_state", "unknown"),
             "inspect_started": inspect_started,
-            "overlay_state": "active" if inspect_started else "inactive",
-            "control_mode": "official_picker" if inspect_started else "capture_read" if active else "none",
+            "overlay_state": "unknown" if cleanup_pending else "active" if inspect_started else "inactive",
+            "cleanup_complete": not cleanup_pending,
+            "retryable": cleanup_pending,
+            "control_mode": "cleanup_pending" if cleanup_pending else "official_picker" if inspect_started else "capture_read" if active else "none",
             "browser_control": (
                 "deep_capture_official_picker"
                 if inspect_started
@@ -2645,12 +2655,12 @@ class ShizaiExtensionBridge:
                 else "none"
             ),
             "runtime_execution": False,
-            "picker_overlay_started": inspect_started,
+            "picker_overlay_started": None if cleanup_pending else inspect_started,
             "truth_source": "last_known_local_state",
             "ui_feedback": current,
             "next_action": (
                 "extension stop-capture"
-                if inspect_started
+                if inspect_started or cleanup_pending
                 else "rpa-scan-page"
                 if active
                 else "workflow rpa-browser-session-start"
@@ -2678,19 +2688,27 @@ class ShizaiExtensionBridge:
                 animation="error",
             )
             raise
+        cleanup_complete = inspect.get("cleanup_complete", not inspect_warning)
+        overlay_state = "inactive" if cleanup_complete else "unknown"
         ui_feedback = _set_capture_ui_feedback(
-            "idle",
-            "ready",
-            "元素拾取已结束，当前 Chrome 会话仍可复用。",
-            overlay_state="inactive",
-            animation="idle",
+            "idle" if cleanup_complete else "waiting",
+            "ready" if cleanup_complete else "stop_capture",
+            "元素拾取已结束，当前 Chrome 会话仍可复用。"
+            if cleanup_complete
+            else "采集会话停止请求已返回，但拾取层关闭未获确认；请重试停止操作。",
+            overlay_state=overlay_state,
+            animation="idle" if cleanup_complete else "waiting",
         )
         response = {
             "project_ref": normalized_package,
             "control_mode": "none",
             "browser_control": "none",
             "runtime_execution": False,
-            "picker_overlay_started": False,
+            "picker_overlay_started": False if cleanup_complete else None,
+            "overlay_state": overlay_state,
+            "cleanup_complete": cleanup_complete,
+            "retryable": not cleanup_complete,
+            "next_tool": None if cleanup_complete else "shizai_extension_stop_capture",
             "inspect_result": inspect_result,
             "result": result,
             "status": self.status(timeout=self._remaining_timeout()),
@@ -2700,6 +2718,7 @@ class ShizaiExtensionBridge:
             global _CAPTURE_SESSION_PACKAGE, _CAPTURE_SESSION_STARTED_AT
             _CAPTURE_SESSION_PACKAGE = None
             _CAPTURE_SESSION_STARTED_AT = 0.0
+        persisted = _read_capture_session_state(normalized_package) or {}
         _write_capture_session_state(
             normalized_package,
             {
@@ -2708,8 +2727,9 @@ class ShizaiExtensionBridge:
                 "package_path": normalized_package,
                 "stopped_at": time.time(),
                 "last_action": "stop_session",
-                "inspect_started": False,
-                "overlay_state": "inactive",
+                "inspect_started": False if cleanup_complete else bool(persisted.get("inspect_started")),
+                "overlay_state": overlay_state,
+                "cleanup_pending": not cleanup_complete,
                 "native_session_state": "stopped",
             },
         )
@@ -2721,15 +2741,31 @@ class ShizaiExtensionBridge:
         """Remove the red picker overlay while keeping DeepCapture connected."""
         try:
             result = self.call("stopDeepCaptureInspect", [], allow_write=True)
+            if not isinstance(result, dict) or result.get("isSuccess") is not True:
+                raise ShizaiCloudError("stopDeepCaptureInspect 未返回成功确认；拾取层状态未知。")
         except (ShizaiCloudError, OSError, TimeoutError, ValueError) as exc:
-            _set_capture_ui_feedback(
+            ui_feedback = _set_capture_ui_feedback(
                 "waiting",
                 "stop_inspect",
                 f"实在 Agent 红色元素拾取层退出返回警告：{exc}",
-                overlay_state="inactive",
+                overlay_state="unknown",
                 animation="waiting",
             )
-            return {"result": None, "warning": str(exc), "overlay_state": "inactive"}
+            with _CAPTURE_SESSION_LOCK:
+                package_path = _CAPTURE_SESSION_PACKAGE
+            if package_path:
+                persisted = _read_capture_session_state(package_path) or {}
+                persisted.update({"last_action": "stop_inspect", "overlay_state": "unknown", "cleanup_pending": True})
+                _write_capture_session_state(package_path, persisted)
+            return {
+                "result": None,
+                "warning": str(exc),
+                "overlay_state": "unknown",
+                "cleanup_complete": False,
+                "retryable": True,
+                "next_tool": "shizai_extension_stop_capture",
+                "ui_feedback": ui_feedback,
+            }
         ui_feedback = _set_capture_ui_feedback(
             "scanning",
             "runtime_capture_session",
@@ -2752,11 +2788,12 @@ class ShizaiExtensionBridge:
                     "last_action": "stop_inspect",
                     "inspect_started": False,
                     "overlay_state": "inactive",
+                    "cleanup_pending": False,
                     "native_session_state": "active_last_known",
                 }
             )
             _write_capture_session_state(package_path, persisted)
-        return {"result": result, "overlay_state": "inactive", "ui_feedback": ui_feedback}
+        return {"result": result, "overlay_state": "inactive", "cleanup_complete": True, "ui_feedback": ui_feedback}
 
     @_capture_budget
     def capture_windows(

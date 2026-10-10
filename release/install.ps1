@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Version = '0.7.32',
+    [string]$Version = '0.7.33',
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ShizaiAgent'),
     [string]$PackagePath,
     [string]$ChecksumPath,

@@ -644,7 +644,14 @@ def extension_stop_capture(ctx: click.Context, project_ref: str | None, allow_wr
         desktop = _desktop()
         bridge = ShizaiExtensionBridge(desktop=desktop)
         try:
-            result = bridge.stop_capture(package_path=project_ref)
+            package_path = None
+            if project_ref:
+                candidate = Path(project_ref).expanduser()
+                package_path = str(
+                    candidate.resolve() if candidate.is_absolute()
+                    else project_core.resolve_project(_paths(ctx), project_ref)
+                )
+            result = bridge.stop_capture(package_path=package_path)
         except (ShizaiCloudError, OSError, ValueError):
             try:
                 NativeMask(client=desktop).close(force=True)

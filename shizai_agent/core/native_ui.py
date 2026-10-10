@@ -82,6 +82,13 @@ def _failure_detail(result: Any, operation: str) -> str | None:
     return detail
 
 
+def _cleanup_failure_detail(result: Any, operation: str) -> str | None:
+    """A missing or rejected acknowledgement cannot prove a surface is hidden."""
+    if isinstance(result, dict) and result.get("isSuccess") is True:
+        return None
+    return _failure_detail(result, operation) or f"{operation} returned no successful cleanup acknowledgement"
+
+
 def _native_ui_failure_detail(detail: str, *, service: str, method: str) -> str:
     """Add context to the designer's opaque screenshot-picker rejection."""
     if (
@@ -185,7 +192,9 @@ class _NativeUiChannel:
             body = packet.get("body") or {}
             current_type = packet.get("packetType")
             if current_type == packet_type and body.get("callId") == call_id:
-                if "result" in body:
+                if body.get("error"):
+                    return {"isSuccess": False, "message": str(body["error"])}
+                if body.get("result") is not None:
                     return body.get("result")
                 # Renderer methods such as updateSmallCardStepText return
                 # void. Their successful response carries only error=null.
@@ -552,9 +561,10 @@ class NativeSmallCard(_NativeUiChannel):
                     "visible": False,
                     "close_result": closed,
                 }
-                warning = _failure_detail(closed, "closeSmallCardWindow")
+                warning = _cleanup_failure_detail(closed, "closeSmallCardWindow")
+                result["cleanup_complete"] = warning is None
                 if warning:
-                    result["close_warning"] = warning
+                    result.update({"visible": None, "state": "unknown", "close_warning": warning})
                 return result
             finally:
                 sock.close()
@@ -693,7 +703,7 @@ class NativeMask(_NativeUiChannel):
                             )
                         except Exception as exc:
                             renderer_closes.append({"target": target, "warning": str(exc)})
-                return {
+                result = {
                     "kind": "shizai_native_mask",
                     "request_id": normalized_request_id or None,
                     "visible": False,
@@ -702,6 +712,20 @@ class NativeMask(_NativeUiChannel):
                     "renderer_closes": renderer_closes,
                     "animation": "native_run_mask",
                 }
+                warnings = []
+                warning = _cleanup_failure_detail(closed, MASK_CLOSE_METHOD)
+                if warning:
+                    warnings.append(warning)
+                for item in renderer_closes:
+                    warning = item.get("warning") or _cleanup_failure_detail(
+                        item.get("result"), f"{MASK_RENDERER_CLOSE_METHOD} ({item['target']})"
+                    )
+                    if warning:
+                        warnings.append(warning)
+                result["cleanup_complete"] = not warnings
+                if warnings:
+                    result.update({"visible": None, "close_warning": "; ".join(warnings)})
+                return result
             finally:
                 sock.close()
 
@@ -792,8 +816,10 @@ class NativeTakeoverFrame(_NativeUiChannel):
                     "animation": "native_blue_purple_breathing_frame",
                     "close_result": closed,
                 }
-                warning = _failure_detail(closed, LOADING_WINDOW_CLOSE_METHOD)
+                warning = _cleanup_failure_detail(closed, LOADING_WINDOW_CLOSE_METHOD)
+                result["cleanup_complete"] = warning is None
                 if warning:
+                    result["visible"] = None
                     result["close_warning"] = warning
                 return result
             finally:

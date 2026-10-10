@@ -1,6 +1,6 @@
 {
   "name": "shizai-agent-mcp",
-  "version": "0.7.32",
+  "version": "0.7.33",
   "description": "Installer and launcher for the Shizai Agent local MCP server",
   "bin": {
     "shizai-agent-mcp": "bin/shizai-agent-mcp.js"

@@ -12637,6 +12637,13 @@ def _native_close_runtime_mask(caller: Any) -> dict[str, Any]:
         result = NativeMask(client=caller).close(force=True)
     except Exception as exc:
         return {"attempted": True, "status": "failed", "error": str(exc)}
+    if result.get("visible") is not False or result.get("close_warning"):
+        return {
+            "attempted": True,
+            "status": "failed",
+            "error": result.get("close_warning") or "Native mask cleanup was not acknowledged",
+            "result": redact_payload(result),
+        }
     return {"attempted": True, "status": "complete", "result": redact_payload(result)}
 
 

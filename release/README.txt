@@ -1,4 +1,4 @@
-Shizai Agent 0.7.32 Windows release
+Shizai Agent 0.7.33 Windows release
 
 Files
 -----
